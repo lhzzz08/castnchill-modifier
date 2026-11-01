@@ -1,5 +1,5 @@
 /* libcncmod —— Cast n Chill 修改器注入模块（入口）
- * 注入方式：launcher 以 DYLD_INSERT_LIBRARIES 拉起游戏（DESIGN.md §5.2）。
+ * 注入方式：launcher 以 DYLD_INSERT_LIBRARIES 拉起游戏。
  *
  * 铁律：本文件的代码运行在后台线程，绝不直接调用任何 IL2CPP API
  * （domain_get / class_from_name / runtime_invoke 等）。冷启动期后台直调

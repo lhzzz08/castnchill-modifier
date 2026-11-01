@@ -1,12 +1,14 @@
 /* M2 P0 功能实现。
  * 全部按名解析（cnc_game_init 缓存），按名调用；零硬编码偏移。 */
 #include "cnc_game.h"
+#include "cnc_json.h"
 #include "cnc_log.h"
 #include "cnc_mt.h"
 #include "cnc_resolver.h"
 
-#include <stdatomic.h>
+#include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,179 +17,153 @@
 
 /* ---------- 调用辅助 ---------- */
 
-static void *invoke0(void *method, void *obj) {
-    void *exc = NULL;
-    return g_il2.runtime_invoke(method, obj, NULL, &exc);
-}
-
-static void *invoke1(void *method, void *obj, void *p0) {
-    void *params[1] = {p0};
-    void *exc = NULL;
-    return g_il2.runtime_invoke(method, obj, params, &exc);
-}
-
-static void *invoke2(void *method, void *obj, void *p0, void *p1) {
-    void *params[2] = {p0, p1};
-    void *exc = NULL;
-    return g_il2.runtime_invoke(method, obj, params, &exc);
-}
-
-/* runtime_invoke 对值类型返回会装箱：[klass 8][monitor 8][data] */
-static int unbox_int(void *boxed) { return boxed ? *(int *)((char *)boxed + 0x10) : 0; }
-static float unbox_float(void *boxed) { return boxed ? *(float *)((char *)boxed + 0x10) : 0.f; }
-
-/* runtime_invoke 包装：记录异常供诊断（避免静默失败） */
+/* runtime_invoke 包装：必须传 exc 出参（传 NULL 时托管异常会直接让进程崩溃），
+ * 最近一次异常记在 last_exc 供诊断。method 为空（游戏更新后没解析到）时不调用。 */
 static void *last_exc = NULL;
 
 static void *inv0(void *method, void *obj) {
     last_exc = NULL;
+    if (!method) return NULL;
     return g_il2.runtime_invoke(method, obj, NULL, &last_exc);
 }
 static void *inv1(void *method, void *obj, void *p0) {
     void *params[1] = {p0};
     last_exc = NULL;
+    if (!method) return NULL;
     return g_il2.runtime_invoke(method, obj, params, &last_exc);
 }
-static void *inv2(void *method, void *obj, void *p0, void *p1) {
-    void *params[2] = {p0, p1};
-    last_exc = NULL;
-    return g_il2.runtime_invoke(method, obj, params, &last_exc);
+
+/* runtime_invoke 对值类型返回会装箱：[klass 8][monitor 8][data]。
+ * 调用失败（异常/空返回）返回 false —— 不能把失败当成 0 参与计算 */
+static bool inv_int(void *method, void *obj, int *out) {
+    void *boxed = inv0(method, obj);
+    if (last_exc || !boxed) return false;
+    *out = *(int *)((char *)boxed + 0x10);
+    return true;
 }
+static bool inv_float(void *method, void *obj, float *out) {
+    void *boxed = inv0(method, obj);
+    if (last_exc || !boxed) return false;
+    *out = *(float *)((char *)boxed + 0x10);
+    return true;
+}
+
+/* 托管对象头第一个字段是类指针 */
+static void *obj_klass(void *obj) { return *(void **)obj; }
 
 /* ---------- 解析缓存 ---------- */
 
-static void *g_journal, *g_journal_inst;      /* Game.Journal + 单例实例 */
-static void *m_get_Instance, *m_get_Cash, *m_set_Cash, *m_SaveEntry;
+static void *g_journal;                       /* Game.Journal */
+static void *m_get_Instance, *m_get_Cash, *m_set_Cash;
 static void *m_get_CatchesToSellCount, *m_SellNext;
-static void *g_tip_entry;                     /* Game.CashTipJournalEntry */
-static int g_tip_value_off = -1;
-static void *g_time;                          /* UnityEngine.Time */
-static void *m_get_timeScale, *m_set_timeScale;
-static void *g_gm;                            /* Game.GameManager */
-static void *m_get_NormalTimeScale, *m_set_NormalTimeScale;
-static void *g_stats;                         /* Steamworks.SteamUserStats */
-static void *m_GetAchievementCount, *m_GetAchievementName, *m_GetAchievement;
-static void *m_ClearAchievement, *m_StoreStats;
-static void *g_jmgr;                          /* Game.JournalManager */
-static void *m_jmgr_get_Instance, *m_jmgr_Save;
 static void *m_TipRusty;
+static int g_time_of_day_off = -1;            /* Journal.m_timeOfDay */
+static void *m_get_timeScale, *m_set_timeScale;
+static void *m_set_NormalTimeScale;           /* Game.GameManager */
+static void *m_jmgr_get_Instance, *m_jmgr_Save;
 
+static void *method(void *klass, const char *name, int argc) {
+    return klass ? g_il2.class_get_method_from_name(klass, name, argc) : NULL;
+}
 
+/* 各项缺失只关掉对应功能（命令回 unsupported），不影响其余功能 */
 static bool resolve_all(void) {
     bool ok = true;
 
     g_journal = cnc_find_class("Game", "Journal");
-    if (!g_journal) { cnc_log("game: Game.Journal 未找到"); return false; }
-    m_get_Instance = g_il2.class_get_method_from_name(g_journal, "get_Instance", 0);
-    m_get_Cash = g_il2.class_get_method_from_name(g_journal, "get_Cash", 0);
-    m_set_Cash = g_il2.class_get_method_from_name(g_journal, "set_Cash", 1);
-    m_SaveEntry = g_il2.class_get_method_from_name(g_journal, "SaveEntry", 1);
-    m_get_CatchesToSellCount =
-        g_il2.class_get_method_from_name(g_journal, "get_CatchesToSellCount", 0);
-    m_SellNext = g_il2.class_get_method_from_name(g_journal, "SellNext", 0);
-    m_TipRusty = g_il2.class_get_method_from_name(g_journal, "TipRusty", 1);
-    if (!m_TipRusty) cnc_log("game: TipRusty 未找到（金钱类功能不可用）");
-    if (!m_get_Instance || !m_get_Cash || !m_SaveEntry || !m_SellNext) {
-        cnc_log("game: Journal 关键方法缺失");
-        return false;
+    if (!g_journal) cnc_log("game: Game.Journal 未找到");
+    m_get_Instance = method(g_journal, "get_Instance", 0);
+    m_get_Cash = method(g_journal, "get_Cash", 0);
+    m_set_Cash = method(g_journal, "set_Cash", 1);
+    m_get_CatchesToSellCount = method(g_journal, "get_CatchesToSellCount", 0);
+    m_SellNext = method(g_journal, "SellNext", 0);
+    m_TipRusty = method(g_journal, "TipRusty", 1);
+    void *tod = g_journal ? g_il2.class_get_field_from_name(g_journal, "m_timeOfDay") : NULL;
+    if (tod) g_time_of_day_off = g_il2.field_get_offset(tod);
+    if (!m_get_Instance || !m_get_Cash) {
+        cnc_log("game: Journal.Instance/Cash 缺失（金钱/卖鱼/时间不可用）");
+        ok = false;
+    }
+    if (!m_TipRusty) { cnc_log("game: TipRusty 未找到（金钱类功能不可用）"); ok = false; }
+    if (!m_get_CatchesToSellCount || !m_SellNext) {
+        cnc_log("game: SellNext 未找到（一键卖鱼不可用）");
+        ok = false;
     }
 
-    g_tip_entry = cnc_find_class("Game", "CashTipJournalEntry");
-    void *fld = g_tip_entry ? g_il2.class_get_field_from_name(g_tip_entry, "value") : NULL;
-    if (g_tip_entry && fld) {
-        g_tip_value_off = g_il2.field_get_offset(fld);
-    } else {
-        cnc_log("game: CashTipJournalEntry.value 未找到（金钱将仅改内存不落盘）");
-    }
-
-    g_time = cnc_find_class("UnityEngine", "Time");
-    if (g_time) {
-        m_get_timeScale = g_il2.class_get_method_from_name(g_time, "get_timeScale", 0);
-        m_set_timeScale = g_il2.class_get_method_from_name(g_time, "set_timeScale", 1);
-    }
+    void *tk = cnc_find_class("UnityEngine", "Time");
+    m_get_timeScale = method(tk, "get_timeScale", 0);
+    m_set_timeScale = method(tk, "set_timeScale", 1);
     if (!m_set_timeScale) { cnc_log("game: Time.set_timeScale 未找到"); ok = false; }
 
-    g_gm = cnc_find_class("Game", "GameManager");
-    if (g_gm) {
-        m_get_NormalTimeScale = g_il2.class_get_method_from_name(g_gm, "get_NormalTimeScale", 0);
-        m_set_NormalTimeScale = g_il2.class_get_method_from_name(g_gm, "set_NormalTimeScale", 1);
-    }
+    m_set_NormalTimeScale = method(cnc_find_class("Game", "GameManager"), "set_NormalTimeScale", 1);
     if (!m_set_NormalTimeScale) cnc_log("game: NormalTimeScale 未找到（加速仍可用，暂停恢复时可能还原）");
 
-    g_stats = cnc_find_class("Steamworks", "SteamUserStats");
-    if (g_stats) {
-        m_GetAchievementCount = g_il2.class_get_method_from_name(g_stats, "GetAchievementCount", 0);
-        m_GetAchievementName = g_il2.class_get_method_from_name(g_stats, "GetAchievementName", 1);
-        m_GetAchievement = g_il2.class_get_method_from_name(g_stats, "GetAchievement", 2);
-        m_ClearAchievement = g_il2.class_get_method_from_name(g_stats, "ClearAchievement", 1);
-        m_StoreStats = g_il2.class_get_method_from_name(g_stats, "StoreStats", 0);
-    }
-    if (!m_ClearAchievement) cnc_log("game: SteamUserStats 未找到（成就拦截不可用）");
-
-    g_jmgr = cnc_find_class("Game", "JournalManager");
-    if (g_jmgr) {
-        m_jmgr_get_Instance = g_il2.class_get_method_from_name(g_jmgr, "get_Instance", 0);
-        m_jmgr_Save = g_il2.class_get_method_from_name(g_jmgr, "Save", 1);
-    }
+    void *jmgr = cnc_find_class("Game", "JournalManager");
+    m_jmgr_get_Instance = method(jmgr, "get_Instance", 0);
+    m_jmgr_Save = method(jmgr, "Save", 1);
     if (!m_jmgr_Save) cnc_log("game: JournalManager.Save 未找到（改动将等游戏自动落盘）");
     return ok;
 }
 
 bool cnc_game_init(void) {
-    if (!resolve_all()) return false;
-    g_journal_inst = invoke0(m_get_Instance, NULL);
-    if (!g_journal_inst) {
-        cnc_log("game: Journal.Instance 为空（还在主菜单/存档未加载，cash 命令暂不可用）");
-        /* 不算失败：进存档后 dispatch 时会再取 */
-    }
-    cnc_log("game: 功能层解析完成");
-    return true;
+    bool ok = resolve_all();
+    cnc_log("game: 功能层解析完成%s", ok ? "" : "（部分缺失）");
+    return ok;
 }
 
 /* ---------- F01 金钱 ---------- */
 
+static bool cash_supported(void) { return m_get_Instance && m_get_Cash && m_TipRusty; }
+
+static void *journal(void) {
+    void *inst = inv0(m_get_Instance, NULL);
+    return last_exc ? NULL : inst;
+}
+
 int cnc_game_cash(void) {
-    if (!g_journal) return -1;
-    void *inst = invoke0(m_get_Instance, NULL);
-    if (!inst) return -1;
-    g_journal_inst = inst;
-    return unbox_int(invoke0(m_get_Cash, inst));
+    void *inst = journal();
+    int cash;
+    if (!inst || !inv_int(m_get_Cash, inst, &cash)) return -1;
+    return cash;
 }
 
 /* 改动立即落盘（SaveEntry 只入队，JournalManager.Save 才写文件） */
 static void flush_save(void) {
-    if (!m_jmgr_get_Instance || !m_jmgr_Save) return;
-    void *mgr = invoke0(m_jmgr_get_Instance, NULL);
-    if (!mgr) return;
+    void *mgr = inv0(m_jmgr_get_Instance, NULL);
+    if (!mgr || !m_jmgr_Save) return;
     bool force = true;
-    invoke1(m_jmgr_Save, mgr, &force);
+    inv1(m_jmgr_Save, mgr, &force);
 }
 
-/* F01 金钱：走游戏原生 TipRusty(int) 通道（现金小费事件）。
- * 实测语义：TipRusty(x) => cash -= x，且事件立即入队落盘。
- * 故 加钱 N = TipRusty(-N)；设值 T = TipRusty(cash - T)。 */
+/* TipRusty 原生改钱：delta 为正加钱、为负扣钱，事件即时入队落盘。
+ * 实测语义：TipRusty(x) => cash -= x，故传 -delta。 */
+static bool tip_delta(void *inst, long delta) {
+    if (!m_TipRusty) return false;
+    if (delta == 0) return true;
+    if (delta > INT_MAX) delta = INT_MAX;
+    if (delta < -(long)INT_MAX) delta = -(long)INT_MAX;
+    int tip = (int)-delta;
+    inv1(m_TipRusty, inst, &tip);
+    if (last_exc) {
+        cnc_log("game: TipRusty 异常 %p", last_exc);
+        return false;
+    }
+    return true;
+}
 
-static bool cash_apply(int target) {
-    void *inst = inv0(m_get_Instance, NULL);
-    if (!inst) return false;
-    g_journal_inst = inst;
-    if (!m_TipRusty) {
-        m_TipRusty = g_il2.class_get_method_from_name(g_journal, "TipRusty", 1);
-        if (!m_TipRusty) return false;
-    }
-    int cur = unbox_int(inv0(m_get_Cash, inst));
-    int tip = cur - target;
-    if (tip != 0) {
-        inv1(m_TipRusty, inst, &tip);
-        if (last_exc) {
-            cnc_log("game: TipRusty 异常 %p", last_exc);
-            return false;
-        }
-    }
+/* F01 金钱：设值 T = TipRusty(cash - T)；set_Cash 只作兜底 */
+static bool cash_apply(long target) {
+    if (!cash_supported()) return false;
+    void *inst = journal();
+    int cur;
+    if (!inst || !inv_int(m_get_Cash, inst, &cur)) return false;
+    if (target < 0) target = 0;
+    if (target > INT_MAX) target = INT_MAX;
+    if (!tip_delta(inst, target - cur)) return false;
     /* set_Cash 兜底（正常情况 TipRusty 已生效，跳过避免双写） */
-    int now = unbox_int(inv0(m_get_Cash, inst));
-    if (now != target && m_set_Cash) {
-        int v = target;
+    int now;
+    if (m_set_Cash && inv_int(m_get_Cash, inst, &now) && now != target) {
+        int v = (int)target;
         inv1(m_set_Cash, inst, &v);
     }
     flush_save();
@@ -197,15 +173,47 @@ static bool cash_apply(int target) {
 /* ---------- F02 加速（D4：≤16×） ---------- */
 
 float cnc_game_speed(void) {
-    if (!m_get_timeScale) return 0.f;
-    return unbox_float(invoke0(m_get_timeScale, NULL));
+    float x = 0.f;
+    if (!inv_float(m_get_timeScale, NULL, &x)) return 0.f;
+    return x;
 }
 
 static void speed_apply(float x) {
     if (x < 0.25f) x = 0.25f;
     if (x > 16.f) x = 16.f;
-    if (m_set_NormalTimeScale) invoke1(m_set_NormalTimeScale, NULL, &x);
-    invoke1(m_set_timeScale, NULL, &x);
+    if (m_set_NormalTimeScale) inv1(m_set_NormalTimeScale, NULL, &x);
+    inv1(m_set_timeScale, NULL, &x);
+}
+
+/* ---------- 单 tick / 单命令内的实例枚举缓存 ----------
+ * FindObjectsOfTypeAll 扫全部托管对象，代价大；同一次主线程调用里同一个类只枚举一次。
+ * 数组由缓存持有，icache_end() 统一释放（cnc_game_dispatch 与 tick 结束时调用）。 */
+
+#define ICACHE_MAX 16
+
+static struct {
+    void *klass;
+    void **insts;
+    size_t n;
+} g_icache[ICACHE_MAX];
+static int g_icache_n;
+
+static void icache_end(void) {
+    for (int i = 0; i < g_icache_n; i++) free(g_icache[i].insts);
+    g_icache_n = 0;
+}
+
+static void **instances(void *klass, size_t *n) {
+    for (int i = 0; i < g_icache_n; i++)
+        if (g_icache[i].klass == klass) { *n = g_icache[i].n; return g_icache[i].insts; }
+    void **insts = cnc_find_instances(klass, n);
+    if (!insts) return NULL;
+    if (g_icache_n == ICACHE_MAX) icache_end(); /* 调用方都不跨类持有数组，满了整体清空即可 */
+    g_icache[g_icache_n].klass = klass;
+    g_icache[g_icache_n].insts = insts;
+    g_icache[g_icache_n].n = *n;
+    g_icache_n++;
+    return insts;
 }
 
 /* ---------- F17 船存容量（实例枚举 + 字段直写） ---------- */
@@ -217,7 +225,7 @@ static int storage_max(void) {
     if (!fld) return -2;
     int off = g_il2.field_get_offset(fld);
     size_t n = 0;
-    void **insts = cnc_find_instances(klass, &n);
+    void **insts = instances(klass, &n);
     if (!insts) return -3;
     int changed = 0, maxcap = 0;
     for (size_t i = 0; i < n; i++) {
@@ -227,7 +235,6 @@ static int storage_max(void) {
         *(int *)((char *)insts[i] + off) = 9999;
         changed++;
     }
-    free(insts);
     cnc_log("game: 船存容量 %d 个实例已拉满（原最大 %d）", changed, maxcap);
     return changed;
 }
@@ -236,31 +243,36 @@ static int storage_max(void) {
 
 static float g_sell_mult = 1.0f;
 
-/* ---------- F08 消费不减（现金锁定轮询） ---------- */
-
-
 /* ---------- F03 一键卖鱼（含 F07 售价倍率结算补差） ---------- */
 
+static bool sell_supported(void) {
+    return m_get_Instance && m_get_CatchesToSellCount && m_SellNext;
+}
+
+/* 返回卖出条数；-1 = 存档未加载 */
 static int sell_all(void) {
-    void *inst = invoke0(m_get_Instance, NULL);
+    void *inst = journal();
     if (!inst) return -1;
-    int sold = 0;
-    for (;;) {
-        int n = unbox_int(invoke0(m_get_CatchesToSellCount, inst));
-        if (n <= 0 || sold >= 500) break;
-        invoke0(m_SellNext, inst);
+    int sold = 0, left = 0;
+    while (sold < 500 && inv_int(m_get_CatchesToSellCount, inst, &left) && left > 0) {
+        inv0(m_SellNext, inst);
+        if (last_exc) {
+            cnc_log("game: SellNext 异常 %p（已卖 %d 条）", last_exc, sold);
+            break;
+        }
         sold++;
     }
     return sold;
 }
 
-
-/* ---------- M4 配置资产补丁框架 v3：实例枚举 + 字段直写 + 原值恢复 ---------- */
-
-#define MAX_PATCH_INSTS 320
+/* ---------- M4 配置资产补丁框架 v4：实例枚举 + 字段直写 + 原值恢复 ----------
+ * v4：记录表改为动态数组（v3 定长 320 条，满了之后照写不记 → 关不回去，
+ * 'm' 倍率还会每 tick 复合放大）；每条记录存类指针，恢复/复写前校验，
+ * 对象被卸载、内存被别的对象复用时不再写入。 */
 
 typedef struct {
     void *inst;
+    void *klass; /* 记录时 inst 的类指针 */
     int off;
     bool is_float;
     float f0;
@@ -271,14 +283,16 @@ typedef struct {
     const char *tag;
     bool on;
     float mult;
-    prec_t recs[MAX_PATCH_INSTS];
-    int n;
+    prec_t *recs;
+    int n, cap;
 } patch_t;
 
-static patch_t g_patches[24];
+#define MAX_PATCHES 24
+
+static patch_t g_patches[MAX_PATCHES];
 
 static patch_t *patch_find(const char *tag) {
-    for (int i = 0; i < 24; i++)
+    for (int i = 0; i < MAX_PATCHES; i++)
         if (g_patches[i].tag && strcmp(g_patches[i].tag, tag) == 0) return &g_patches[i];
     return NULL;
 }
@@ -286,7 +300,7 @@ static patch_t *patch_find(const char *tag) {
 static patch_t *patch_get(const char *tag) {
     patch_t *p = patch_find(tag);
     if (p) return p;
-    for (int i = 0; i < 24; i++) {
+    for (int i = 0; i < MAX_PATCHES; i++) {
         if (!g_patches[i].tag) {
             g_patches[i].tag = tag;
             g_patches[i].on = false;
@@ -298,58 +312,60 @@ static patch_t *patch_get(const char *tag) {
     return NULL;
 }
 
+/* 恢复全部原值并清空记录（下次开启重新记录，不残留已卸载对象的指针） */
 static void patch_restore(const char *tag) {
     patch_t *p = patch_find(tag);
-    if (!p || !p->on) return;
-    for (int i = 0; i < p->n; i++) {
-        prec_t *r = &p->recs[i];
-        if (!r->inst) continue;
-        if (r->is_float) *(float *)((char *)r->inst + r->off) = r->f0;
-        else *(int *)((char *)r->inst + r->off) = r->i0;
+    if (!p) return;
+    if (p->on) {
+        for (int i = 0; i < p->n; i++) {
+            prec_t *r = &p->recs[i];
+            if (obj_klass(r->inst) != r->klass) continue; /* 对象已不在 */
+            if (r->is_float) *(float *)((char *)r->inst + r->off) = r->f0;
+            else *(int *)((char *)r->inst + r->off) = r->i0;
+        }
     }
+    p->n = 0;
     p->on = false;
     p->mult = 1;
+}
+
+/* 找到或新建 (inst, off) 的原值记录；内存不够返回 NULL（调用方不写，保证可恢复） */
+static prec_t *prec_slot(patch_t *p, void *inst, int off, bool is_float) {
+    void *k = obj_klass(inst);
+    for (int j = 0; j < p->n; j++) {
+        prec_t *r = &p->recs[j];
+        if (r->inst != inst || r->off != off) continue;
+        if (r->klass == k) return r;
+        *r = p->recs[--p->n]; /* 旧对象没了、地址被复用：作废旧记录，重新记录 */
+        break;
+    }
+    if (p->n == p->cap) {
+        int ncap = p->cap ? p->cap * 2 : 64;
+        prec_t *nr = realloc(p->recs, (size_t)ncap * sizeof *nr);
+        if (!nr) return NULL;
+        p->recs = nr;
+        p->cap = ncap;
+    }
+    prec_t *r = &p->recs[p->n++];
+    r->inst = inst;
+    r->klass = k;
+    r->off = off;
+    r->is_float = is_float;
+    if (is_float) r->f0 = *(float *)((char *)inst + off);
+    else r->i0 = *(int *)((char *)inst + off);
+    return r;
 }
 
 /* 记录原值并写新值。kind: 's'=set 'm'=mult（以首次记录的原值为基准，
  * 重应用 tick 反复调用也不会复合放大） */
 static void prec_write(patch_t *p, void *inst, int off, char kind, float val) {
-    int known_idx = -1;
-    for (int j = 0; j < p->n; j++)
-        if (p->recs[j].inst == inst && p->recs[j].off == off) { known_idx = j; break; }
-    float base;
-    if (known_idx >= 0) {
-        base = p->recs[known_idx].f0;
-    } else {
-        base = *(float *)((char *)inst + off);
-        if (p->n < MAX_PATCH_INSTS) {
-            p->recs[p->n].inst = inst;
-            p->recs[p->n].off = off;
-            p->recs[p->n].is_float = true;
-            p->recs[p->n].f0 = base;
-            p->n++;
-        }
-    }
-    *(float *)((char *)inst + off) = kind == 'm' ? base * val : val;
+    prec_t *r = prec_slot(p, inst, off, true);
+    if (!r) return;
+    *(float *)((char *)inst + off) = kind == 'm' ? r->f0 * val : val;
 }
 
 static void prec_write_i(patch_t *p, void *inst, int off, int val) {
-    int known_idx = -1;
-    for (int j = 0; j < p->n; j++)
-        if (p->recs[j].inst == inst && p->recs[j].off == off) { known_idx = j; break; }
-    int i0;
-    if (known_idx >= 0) {
-        i0 = p->recs[known_idx].i0;
-    } else {
-        i0 = *(int *)((char *)inst + off);
-        if (p->n < MAX_PATCH_INSTS) {
-            p->recs[p->n].inst = inst;
-            p->recs[p->n].off = off;
-            p->recs[p->n].is_float = false;
-            p->recs[p->n].i0 = i0;
-            p->n++;
-        }
-    }
+    if (!prec_slot(p, inst, off, false)) return;
     *(int *)((char *)inst + off) = val;
 }
 
@@ -361,7 +377,7 @@ static int patch_asset_field(patch_t *p, const char *cls, const char *field, cha
     if (!fld) return -2;
     int off = g_il2.field_get_offset(fld);
     size_t n = 0;
-    void **insts = cnc_find_instances(klass, &n);
+    void **insts = instances(klass, &n);
     if (!insts) return -3;
     int changed = 0;
     for (size_t i = 0; i < n; i++) {
@@ -369,7 +385,6 @@ static int patch_asset_field(patch_t *p, const char *cls, const char *field, cha
         prec_write(p, insts[i], off, kind, val);
         changed++;
     }
-    free(insts);
     return changed;
 }
 
@@ -380,7 +395,7 @@ static int patch_asset_field_i(patch_t *p, const char *cls, const char *field, i
     if (!fld) return -2;
     int off = g_il2.field_get_offset(fld);
     size_t n = 0;
-    void **insts = cnc_find_instances(klass, &n);
+    void **insts = instances(klass, &n);
     if (!insts) return -3;
     int changed = 0;
     for (size_t i = 0; i < n; i++) {
@@ -388,7 +403,6 @@ static int patch_asset_field_i(patch_t *p, const char *cls, const char *field, i
         prec_write_i(p, insts[i], off, val);
         changed++;
     }
-    free(insts);
     return changed;
 }
 
@@ -417,7 +431,7 @@ static int patch_asset_field2(patch_t *p, const char *cls, const char *field, fl
     int omax = g_il2.field_get_offset(fmax);
 
     size_t n = 0;
-    void **insts = cnc_find_instances(klass, &n);
+    void **insts = instances(klass, &n);
     if (!insts) return -5;
     int changed = 0;
     for (size_t i = 0; i < n; i++) {
@@ -428,7 +442,6 @@ static int patch_asset_field2(patch_t *p, const char *cls, const char *field, fl
         prec_write(p, rangeobj, omax, 's', val);
         changed++;
     }
-    free(insts);
     return changed;
 }
 
@@ -453,7 +466,7 @@ static int patch_nested(patch_t *p, const char *parent_cls, const char *parent_f
     int ioff = g_il2.field_get_offset(ifld);
 
     size_t n = 0;
-    void **insts = cnc_find_instances(pk, &n);
+    void **insts = instances(pk, &n);
     if (!insts) return -5;
     int changed = 0;
     for (size_t i = 0; i < n; i++) {
@@ -464,7 +477,6 @@ static int patch_nested(patch_t *p, const char *parent_cls, const char *parent_f
         prec_write(p, inner, ioff, kind, val);
         changed++;
     }
-    free(insts);
     return changed;
 }
 
@@ -521,7 +533,12 @@ static void apply_boat_fast(void) {
     patch_nested(p, "GameplayConfig", "dockWalking", "walkSpeed", 'm', mult);
 }
 
+/* tick 线程按"代"运行：关闭或重开都会换代，旧线程醒来发现代号变了就退出，
+ * 2s 内先关后开也不会出现两个 tick 线程。pending 防止主线程卡顿时 tick 堆积。
+ * tick 线程只负责 post，不碰托管堆，所以不 attach il2cpp。 */
 static atomic_bool g_m4_tick_on = false;
+static atomic_uint g_m4_gen;
+static atomic_bool g_m4_pending;
 
 static void apply_fish_stamina(void);
 static void apply_fish_bite(void);
@@ -534,6 +551,7 @@ static void apply_ice_fast(void);
 
 static void m4_apply_all(void *unused) {
     (void)unused;
+    atomic_store(&g_m4_pending, false);
     if (!atomic_load(&g_m4_tick_on)) return;
     patch_t *p;
     if ((p = patch_find("fish.stamina")) && p->on) apply_fish_stamina();
@@ -544,41 +562,46 @@ static void m4_apply_all(void *unused) {
     if ((p = patch_find("boat.fast")) && p->on) apply_boat_fast();
     if ((p = patch_find("reel.fast")) && p->on) apply_reel_fast();
     if ((p = patch_find("ice.fast")) && p->on) apply_ice_fast();
+    icache_end();
 }
 
+/* 需要 tick 重应用的补丁（fish.trophy 是一次性写入，不在此列） */
+static const char *const k_tick_tags[] = {"fish.stamina", "fish.bite", "line.safe", "player.stamina",
+                                          "cast.super", "boat.fast", "reel.fast", "ice.fast"};
+
 static bool m4_any_enabled(void) {
-    static const char *tags[] = {"fish.stamina", "fish.bite", "line.safe",
-                                 "player.stamina", "cast.super", "boat.fast", "reel.fast", "ice.fast"};
-    for (size_t i = 0; i < sizeof tags / sizeof tags[0]; i++) {
-        patch_t *p = patch_find(tags[i]);
+    for (size_t i = 0; i < sizeof k_tick_tags / sizeof k_tick_tags[0]; i++) {
+        patch_t *p = patch_find(k_tick_tags[i]);
         if (p && p->on) return true;
     }
     return false;
 }
 
-static void *m4_tick_thread(void *unused) {
-    (void)unused;
-    cnc_il2cpp_attach();
-    while (atomic_load(&g_m4_tick_on)) {
-        cnc_mt_post(m4_apply_all, NULL);
+static void *m4_tick_thread(void *arg) {
+    unsigned gen = (unsigned)(uintptr_t)arg;
+    while (atomic_load(&g_m4_gen) == gen) {
+        if (!atomic_exchange(&g_m4_pending, true))
+            if (!cnc_mt_post(m4_apply_all, NULL)) atomic_store(&g_m4_pending, false);
         usleep(2 * 1000 * 1000);
     }
     return NULL;
 }
 
 static void m4_ensure_tick(void) {
-    bool expected = false;
-    if (atomic_compare_exchange_strong(&g_m4_tick_on, &expected, true)) {
-        pthread_t th;
-        if (pthread_create(&th, NULL, m4_tick_thread, NULL) == 0)
-            pthread_detach(th);
-        else
-            atomic_store(&g_m4_tick_on, false);
-    }
+    if (atomic_load(&g_m4_tick_on)) return;
+    unsigned gen = atomic_fetch_add(&g_m4_gen, 1) + 1;
+    atomic_store(&g_m4_tick_on, true);
+    pthread_t th;
+    if (pthread_create(&th, NULL, m4_tick_thread, (void *)(uintptr_t)gen) == 0)
+        pthread_detach(th);
+    else
+        atomic_store(&g_m4_tick_on, false);
 }
 
 static void m4_stop_if_idle(void) {
-    if (!m4_any_enabled()) atomic_store(&g_m4_tick_on, false);
+    if (m4_any_enabled()) return;
+    atomic_store(&g_m4_tick_on, false);
+    atomic_fetch_add(&g_m4_gen, 1);
 }
 
 /* 开关入口：on = 标记 + 立即应用一次 + 确保 tick 存活；off = 恢复原值 + 空闲则停 tick */
@@ -716,28 +739,50 @@ static void f_fish_trophy(bool on) {
 
 /* ---------- M5: F21 即时码头销售 + F24 时间控制 ---------- */
 
+/* 与 M4 tick 同样按"代"运行，防止快速开关出现两个线程 */
 static atomic_bool g_sell_instant = false;
+static atomic_uint g_sell_gen;
+static atomic_bool g_sell_pending;
+
+/* Boat 实例缓存（只在主线程访问）：每 200ms 全量 FindObjectsOfTypeAll 太重，
+ * 每 10 tick（≈2s）重新枚举一次，其间按记录的类指针校验后直写 */
+static void **g_boats, **g_boat_klass;
+static size_t g_boat_n;
+static int g_boat_off = -1, g_boat_age;
 
 static void sell_tick_on_main(void *unused) {
     (void)unused;
-    void *klass = cnc_find_class("Game", "Boat");
-    if (!klass) return;
-    void *fld = g_il2.class_get_field_from_name(klass, "m_nextSellTime");
-    if (!fld) return;
-    int off = g_il2.field_get_offset(fld);
-    size_t n = 0;
-    void **insts = cnc_find_instances(klass, &n);
-    if (!insts) return;
-    for (size_t i = 0; i < n; i++)
-        if (insts[i]) *(float *)((char *)insts[i] + off) = 0.f;
-    free(insts);
+    atomic_store(&g_sell_pending, false);
+    if (!atomic_load(&g_sell_instant)) return;
+    if (g_boat_off < 0) {
+        void *klass = cnc_find_class("Game", "Boat");
+        void *fld = klass ? g_il2.class_get_field_from_name(klass, "m_nextSellTime") : NULL;
+        if (!fld) return;
+        g_boat_off = g_il2.field_get_offset(fld);
+    }
+    if (!g_boats || ++g_boat_age >= 10) {
+        size_t n = 0;
+        void **insts = cnc_find_instances(cnc_find_class("Game", "Boat"), &n);
+        void **ks = insts ? malloc((n ? n : 1) * sizeof *ks) : NULL;
+        if (!ks) { free(insts); return; }
+        for (size_t i = 0; i < n; i++) ks[i] = insts[i] ? obj_klass(insts[i]) : NULL;
+        free(g_boats);
+        free(g_boat_klass);
+        g_boats = insts;
+        g_boat_klass = ks;
+        g_boat_n = n;
+        g_boat_age = 0;
+    }
+    for (size_t i = 0; i < g_boat_n; i++)
+        if (g_boats[i] && obj_klass(g_boats[i]) == g_boat_klass[i])
+            *(float *)((char *)g_boats[i] + g_boat_off) = 0.f;
 }
 
-static void *sell_tick_thread(void *unused) {
-    (void)unused;
-    cnc_il2cpp_attach();
-    while (atomic_load(&g_sell_instant)) {
-        cnc_mt_post(sell_tick_on_main, NULL);
+static void *sell_tick_thread(void *arg) {
+    unsigned gen = (unsigned)(uintptr_t)arg;
+    while (atomic_load(&g_sell_gen) == gen) {
+        if (!atomic_exchange(&g_sell_pending, true))
+            if (!cnc_mt_post(sell_tick_on_main, NULL)) atomic_store(&g_sell_pending, false);
         usleep(200 * 1000);
     }
     return NULL;
@@ -745,31 +790,30 @@ static void *sell_tick_thread(void *unused) {
 
 static void sell_instant_set(bool on) {
     bool was = atomic_exchange(&g_sell_instant, on);
-    if (on && !was) {
-        pthread_t th;
-        if (pthread_create(&th, NULL, sell_tick_thread, NULL) == 0) pthread_detach(th);
-    }
+    if (on == was) return;
+    unsigned gen = atomic_fetch_add(&g_sell_gen, 1) + 1;
+    if (!on) return;
+    g_boat_age = 10; /* 重开时强制重新枚举 */
+    pthread_t th;
+    if (pthread_create(&th, NULL, sell_tick_thread, (void *)(uintptr_t)gen) == 0)
+        pthread_detach(th);
+    else
+        atomic_store(&g_sell_instant, false);
 }
 
 static bool time_set(float minutes) {
-    void *klass = g_journal;
-    void *fld = g_il2.class_get_field_from_name(klass, "m_timeOfDay");
-    if (!fld) return false;
-    int off = g_il2.field_get_offset(fld);
-    void *inst = inv0(m_get_Instance, NULL);
+    if (g_time_of_day_off < 0) return false;
+    void *inst = journal();
     if (!inst) return false;
-    g_journal_inst = inst;
-    *(float *)((char *)inst + off) = minutes;
+    *(float *)((char *)inst + g_time_of_day_off) = minutes;
     return true;
 }
 
 static float time_get(void) {
-    void *fld = g_il2.class_get_field_from_name(g_journal, "m_timeOfDay");
-    if (!fld) return -1.f;
-    int off = g_il2.field_get_offset(fld);
-    void *inst = inv0(m_get_Instance, NULL);
+    if (g_time_of_day_off < 0) return -1.f;
+    void *inst = journal();
     if (!inst) return -1.f;
-    return *(float *)((char *)inst + off);
+    return *(float *)((char *)inst + g_time_of_day_off);
 }
 
 /* ---------- 命令分发 ---------- */
@@ -784,16 +828,6 @@ static bool parse_float(const char *s, float *out) {
     char *end = NULL;
     *out = strtof(s, &end);
     return end && *end == '\0' && end != s;
-}
-
-/* TipRusty 原生加钱（delta 可负）：正值扣钱、负值加钱，事件即时落盘 */
-static void tip_delta(int delta) {
-    void *inst = inv0(m_get_Instance, NULL);
-    if (!inst) return;
-    if (delta != 0) {
-        int tip = -delta;
-        inv1(m_TipRusty, inst, &tip);
-    }
 }
 
 /* F18 素材：枚举全部资产 ID（外观/鱼种等）写 ~/.castnchill-modifier/game-ids.json */
@@ -823,11 +857,12 @@ static void ids_dump(const char *line, char *out, size_t outsz) {
         if (!fld) continue;
         int off = g_il2.field_get_offset(fld);
         size_t n = 0;
-        void **insts = cnc_find_instances(klass, &n);
+        void **insts = instances(klass, &n);
         if (!insts) continue;
         if (!first_cat) fputs(",", fp);
         first_cat = false;
-        fprintf(fp, "\"%s\":[", k_id_classes[ci]);
+        cnc_json_fputs(fp, k_id_classes[ci]);
+        fputs(":[", fp);
         int written = 0;
         for (size_t i = 0; i < n; i++) {
             if (!insts[i]) continue;
@@ -836,11 +871,10 @@ static void ids_dump(const char *line, char *out, size_t outsz) {
             char *id = cnc_string_to_utf8(str);
             if (!id || !*id) { free(id); continue; }
             if (written) fputc(',', fp);
-            fprintf(fp, "\"%s\"", id);
+            cnc_json_fputs(fp, id);
             free(id);
             written++;
         }
-        free(insts);
         fputs("]", fp);
         char part[64];
         snprintf(part, sizeof part, "%s:%d ", k_id_classes[ci], written);
@@ -848,10 +882,37 @@ static void ids_dump(const char *line, char *out, size_t outsz) {
     }
     fputs("}", fp);
     fclose(fp);
-    snprintf(out, outsz, "{\"ok\":true,\"dump\":\"%s\",\"ids\":\"%s\"}", path, summary);
+    char epath[600], esum[600];
+    cnc_json_escape(path, epath, sizeof epath);
+    cnc_json_escape(summary, esum, sizeof esum);
+    snprintf(out, outsz, "{\"ok\":true,\"dump\":\"%s\",\"ids\":\"%s\"}", epath, esum);
 }
 
-bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
+/* ---------- 命令表（dispatch 与 state.get 共用） ---------- */
+
+static const struct { const char *cmd; void (*fn)(bool); } k_toggles[] = {
+    {"fish.stamina", f_fish_stamina},
+    {"fish.trophy", f_fish_trophy},
+    {"fish.bite", f_fish_bite},
+    {"line.safe", f_line_safe},
+    {"player.stamina", f_player_stamina},
+    {"cast.super", f_cast_super},
+};
+
+static const struct { const char *cmd; void (*fn)(float); float maxv; } k_mults[] = {
+    {"reel.fast", f_reel_fast, 20.f},
+    {"boat.fast", f_boat_fast, 10.f},
+    {"ice.fast", f_ice_fast, 10.f},
+};
+
+#define D4_CASH_STEP 1000000000L /* D4：单次金钱改动 ≤10 亿 */
+
+static bool unsupported(char *out, size_t outsz) {
+    snprintf(out, outsz, "{\"ok\":false,\"error\":\"unsupported（游戏版本不兼容此功能）\"}");
+    return true;
+}
+
+static bool dispatch(const char *line, char *out, size_t outsz) {
     char cmd[64] = {0}, a1[64] = {0};
     sscanf(line, "%63s %63s", cmd, a1);
 
@@ -865,11 +926,23 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
             snprintf(out, outsz, "{\"ok\":false,\"error\":\"bad amount\"}");
             return true;
         }
-        long target = strcmp(cmd, "cash.add") == 0 ? cnc_game_cash() + n : n;
-        if (target < 0) target = 0;
-        if (target > 1000000000L) target = 1000000000L; /* D4：单次 ≤10 亿 */
-        if (!cash_apply((int)target)) {
+        if (!cash_supported()) return unsupported(out, outsz);
+        long cur = cnc_game_cash();
+        if (cur < 0) {
             snprintf(out, outsz, "{\"ok\":false,\"error\":\"journal not loaded（先进存档）\"}");
+            return true;
+        }
+        long target;
+        if (strcmp(cmd, "cash.add") == 0) {
+            /* 限制的是本次增量，而不是结果：已有 >10 亿时加钱不会被压回 10 亿 */
+            if (n > D4_CASH_STEP) n = D4_CASH_STEP;
+            if (n < -D4_CASH_STEP) n = -D4_CASH_STEP;
+            target = cur + n;
+        } else {
+            target = n > D4_CASH_STEP ? D4_CASH_STEP : n;
+        }
+        if (!cash_apply(target)) {
+            snprintf(out, outsz, "{\"ok\":false,\"error\":\"改钱失败（见 /tmp/cnc-mod.log）\"}");
             return true;
         }
         snprintf(out, outsz, "{\"ok\":true,\"cash\":%d}", cnc_game_cash());
@@ -885,6 +958,7 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
             snprintf(out, outsz, "{\"ok\":false,\"error\":\"bad speed\"}");
             return true;
         }
+        if (!m_set_timeScale) return unsupported(out, outsz);
         speed_apply(x);
         snprintf(out, outsz, "{\"ok\":true,\"speed\":%.2f}", cnc_game_speed());
         return true;
@@ -902,20 +976,29 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
         return true;
     }
     if (strcmp(cmd, "sell.all") == 0) {
-        int before = cnc_game_cash();
+        if (!sell_supported()) return unsupported(out, outsz);
+        long before = cnc_game_cash();
         int sold = sell_all();
-        if (sold < 0) {
+        if (sold < 0 || before < 0) {
             snprintf(out, outsz, "{\"ok\":false,\"error\":\"journal not loaded\"}");
             return true;
         }
-        /* F07 结算补差：总卖价 × (mult-1) 通过原生小费通道补发 */
-        int earned = cnc_game_cash() - before;
-        long bonus = (long)((float)earned * (g_sell_mult - 1.0f));
-        if (bonus > 0 && sold > 0) tip_delta((int)bonus);
+        /* F07 结算补差：总卖价 × (mult-1) 通过原生小费通道补发，
+         * 封顶到 int 上限，避免溢出成负数反而扣钱 */
+        long after = cnc_game_cash();
+        long earned = after > before ? after - before : 0;
+        long bonus = 0;
+        if (sold > 0 && earned > 0 && g_sell_mult > 1.0f && m_TipRusty) {
+            double b = (double)earned * (double)(g_sell_mult - 1.0f);
+            long room = (long)INT_MAX - after;
+            bonus = b > (double)room ? room : (long)b;
+            void *inst = journal();
+            if (bonus <= 0 || !inst || !tip_delta(inst, bonus)) bonus = 0;
+        }
         flush_save();
         snprintf(out, outsz,
-                 "{\"ok\":true,\"sold\":%d,\"earned\":%d,\"bonus\":%ld,\"cash\":%d,\"mult\":%.1f}",
-                 sold, earned, (bonus > 0 && sold > 0) ? bonus : 0, cnc_game_cash(), g_sell_mult);
+                 "{\"ok\":true,\"sold\":%d,\"earned\":%ld,\"bonus\":%ld,\"cash\":%d,\"mult\":%.1f}",
+                 sold, earned, bonus, cnc_game_cash(), g_sell_mult);
         return true;
     }
     if (strcmp(cmd, "storage.max") == 0) {
@@ -948,6 +1031,7 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
         }
         if (m < 0) m = 0;
         if (m > 1440) m = 1440;
+        if (g_time_of_day_off < 0) return unsupported(out, outsz);
         if (!time_set(m)) {
             snprintf(out, outsz, "{\"ok\":false,\"error\":\"journal not loaded\"}");
             return true;
@@ -961,45 +1045,32 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
     }
 
     /* ---------- M4 钓鱼增强 ---------- */
-    struct { const char *cmd; void (*fn)(bool); } toggles[] = {
-        {"fish.stamina", f_fish_stamina},
-        {"fish.trophy", f_fish_trophy},
-        {"fish.bite", f_fish_bite},
-        {"line.safe", f_line_safe},
-        {"player.stamina", f_player_stamina},
-        {"cast.super", f_cast_super},
-    };
-    for (size_t i = 0; i < sizeof toggles / sizeof toggles[0]; i++) {
-        if (strcmp(cmd, toggles[i].cmd) == 0) {
+    for (size_t i = 0; i < sizeof k_toggles / sizeof k_toggles[0]; i++) {
+        if (strcmp(cmd, k_toggles[i].cmd) == 0) {
             bool on = strcmp(a1, "on") == 0;
             if (!on && strcmp(a1, "off") != 0) {
                 snprintf(out, outsz, "{\"ok\":false,\"error\":\"usage: %s on|off\"}", cmd);
                 return true;
             }
-            toggles[i].fn(on);
-            patch_t *p = patch_find(toggles[i].cmd);
+            k_toggles[i].fn(on);
+            patch_t *p = patch_find(k_toggles[i].cmd);
             snprintf(out, outsz, "{\"ok\":true,\"feature\":\"%s\",\"state\":\"%s\"}",
-                     toggles[i].cmd, p && p->on ? "on" : "off");
+                     k_toggles[i].cmd, p && p->on ? "on" : "off");
             return true;
         }
     }
-    struct { const char *cmd; void (*fn)(float); float maxv; } mults[] = {
-        {"reel.fast", f_reel_fast, 20.f},
-        {"boat.fast", f_boat_fast, 10.f},
-        {"ice.fast", f_ice_fast, 10.f},
-    };
-    for (size_t i = 0; i < sizeof mults / sizeof mults[0]; i++) {
-        if (strcmp(cmd, mults[i].cmd) == 0) {
+    for (size_t i = 0; i < sizeof k_mults / sizeof k_mults[0]; i++) {
+        if (strcmp(cmd, k_mults[i].cmd) == 0) {
             float x = 0;
             if (!parse_float(a1, &x)) {
                 snprintf(out, outsz, "{\"ok\":false,\"error\":\"bad mult\"}");
                 return true;
             }
             if (x < 1) x = 1;
-            if (x > mults[i].maxv) x = mults[i].maxv;
-            mults[i].fn(x);
-            patch_t *p = patch_find(mults[i].cmd);
-            snprintf(out, outsz, "{\"ok\":true,\"%s\":%.1f}", mults[i].cmd, p && p->on ? p->mult : 1.0f);
+            if (x > k_mults[i].maxv) x = k_mults[i].maxv;
+            k_mults[i].fn(x);
+            patch_t *p = patch_find(k_mults[i].cmd);
+            snprintf(out, outsz, "{\"ok\":true,\"%s\":%.1f}", k_mults[i].cmd, p && p->on ? p->mult : 1.0f);
             return true;
         }
     }
@@ -1021,7 +1092,7 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
         int ocnt = g_il2.field_get_offset(fcnt);
         int ocur = g_il2.field_get_offset(fcur);
         size_t n = 0;
-        void **insts = cnc_find_instances(klass, &n);
+        void **insts = instances(klass, &n);
         if (!insts) {
             snprintf(out, outsz, "{\"ok\":false,\"error\":\"no instances\"}");
             return true;
@@ -1034,7 +1105,6 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
             *(int *)((char *)insts[i] + ocur) = 0;
             reset++;
         }
-        free(insts);
         snprintf(out, outsz,
                  "{\"ok\":true,\"target\":%d,\"was\":%d,\"reset_instances\":%d,"
                  "\"note\":\"计数器已归零，重新抚摸 %d 次即可再次触发\"}",
@@ -1051,7 +1121,7 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
             if (fld) {
                 int off = g_il2.field_get_offset(fld);
                 size_t n = 0;
-                void **insts = cnc_find_instances(fk, &n);
+                void **insts = instances(fk, &n);
                 if (insts) {
                     for (size_t i = 0; i < n; i++) {
                         if (!insts[i]) continue;
@@ -1061,7 +1131,6 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
                         if (v == 1) sones++;
                         scnt++;
                     }
-                    free(insts);
                 }
             }
         }
@@ -1084,7 +1153,7 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
                     int omin = g_il2.field_get_offset(fmin);
                     int omax = g_il2.field_get_offset(fmax);
                     size_t n = 0;
-                    void **insts = cnc_find_instances(dk, &n);
+                    void **insts = instances(dk, &n);
                     if (insts) {
                         for (size_t i = 0; i < n; i++) {
                             if (!insts[i]) continue;
@@ -1096,7 +1165,6 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
                             if (b > dmax) dmax = b;
                             dcnt++;
                         }
-                        free(insts);
                     }
                 }
             }
@@ -1104,7 +1172,7 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
         snprintf(out, outsz,
                  "{\"ok\":true,\"fish_stamina\":{\"count\":%d,\"min\":%d,\"max\":%d,\"ones\":%d},"
                  "\"fight_duration\":{\"count\":%d,\"min\":%.2f,\"max\":%.2f}}",
-                 scnt, smin == 2147483647 ? 0 : smin, smax, sones, dcnt, dmin, dmax);
+                 scnt, scnt ? smin : 0, scnt ? smax : 0, sones, dcnt, dmin, dmax);
         return true;
     }
 
@@ -1128,7 +1196,7 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
                 void *arr = g_il2.runtime_invoke(m, NULL, params, &exc);
                 snprintf(steps + strlen(steps), sizeof steps - strlen(steps),
                          " arr=%p exc=%p", arr, exc);
-                if (arr && !exc) {
+                if (arr && !exc && g_il2.array_length) {
                     size_t len = g_il2.array_length(arr);
                     snprintf(steps + strlen(steps), sizeof steps - strlen(steps),
                              " len=%zu", len);
@@ -1139,7 +1207,9 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
                      " class_get_type=%p type_get_object=%p",
                      (void *)g_il2.class_get_type, (void *)g_il2.type_get_object);
         }
-        snprintf(out, outsz, "{\"ok\":true,\"cls\":\"%s\",\"%s\"}", a1, steps);
+        char ecls[160];
+        cnc_json_escape(a1, ecls, sizeof ecls);
+        snprintf(out, outsz, "{\"ok\":true,\"cls\":\"%s\",\"steps\":\"%s\"}", ecls, steps);
         return true;
     }
 
@@ -1159,19 +1229,15 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
             snprintf(out, outsz, "{\"ok\":false,\"error\":\"bad amount\"}");
             return true;
         }
-        void *inst = inv0(m_get_Instance, NULL);
+        if (!m_TipRusty) return unsupported(out, outsz);
+        void *inst = journal();
         if (!inst) {
             snprintf(out, outsz, "{\"ok\":false,\"error\":\"journal not loaded\"}");
             return true;
         }
-        void *m_tip = g_il2.class_get_method_from_name(g_journal, "TipRusty", 1);
-        if (!m_tip) {
-            snprintf(out, outsz, "{\"ok\":false,\"error\":\"TipRusty not found\"}");
-            return true;
-        }
         int before = cnc_game_cash();
-        int v = (int)n;
-        inv1(m_tip, inst, &v);
+        int v = n > INT_MAX ? INT_MAX : n < -(long)INT_MAX ? -INT_MAX : (int)n;
+        inv1(m_TipRusty, inst, &v);
         if (last_exc) cnc_log("game: TipRusty 异常 %p", last_exc);
         flush_save();
         snprintf(out, outsz, "{\"ok\":true,\"before\":%d,\"after\":%d}", before, cnc_game_cash());
@@ -1180,6 +1246,49 @@ bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
 
     /* 未匹配命令 → 交给上层报 unknown cmd（不可缺：缺了会跌出函数返回垃圾值） */
     return false;
+}
+
+bool cnc_game_dispatch(const char *line, char *out, size_t outsz) {
+    bool handled = dispatch(line, out, outsz);
+    icache_end(); /* 本次命令枚举的实例数组不跨调用保留（对象可能随场景卸载） */
+    return handled;
+}
+
+void cnc_game_state_json(char *out, size_t outsz) {
+    int len = snprintf(out, outsz, "\"cash\":%d,\"speed\":%.2f,\"sell_mult\":%.1f,"
+                       "\"sell_instant\":%s,\"features\":[",
+                       cnc_game_cash(), cnc_game_speed(), g_sell_mult,
+                       atomic_load(&g_sell_instant) ? "true" : "false");
+    const char *feats[] = {
+        cash_supported() ? "cash" : NULL,
+        m_set_timeScale ? "speed" : NULL,
+        sell_supported() ? "sell" : NULL,
+        g_time_of_day_off >= 0 ? "time" : NULL,
+    };
+    bool first = true;
+    for (size_t i = 0; i < sizeof feats / sizeof feats[0]; i++) {
+        if (!feats[i] || len < 0 || (size_t)len >= outsz) continue;
+        len += snprintf(out + len, outsz - (size_t)len, "%s\"%s\"", first ? "" : ",", feats[i]);
+        first = false;
+    }
+    if (len >= 0 && (size_t)len < outsz)
+        len += snprintf(out + len, outsz - (size_t)len, "],\"toggles\":{");
+    for (size_t i = 0; i < sizeof k_toggles / sizeof k_toggles[0]; i++) {
+        if (len < 0 || (size_t)len >= outsz) break;
+        patch_t *p = patch_find(k_toggles[i].cmd);
+        len += snprintf(out + len, outsz - (size_t)len, "%s\"%s\":%s", i ? "," : "",
+                        k_toggles[i].cmd, p && p->on ? "true" : "false");
+    }
+    if (len >= 0 && (size_t)len < outsz)
+        len += snprintf(out + len, outsz - (size_t)len, "},\"mults\":{");
+    for (size_t i = 0; i < sizeof k_mults / sizeof k_mults[0]; i++) {
+        if (len < 0 || (size_t)len >= outsz) break;
+        patch_t *p = patch_find(k_mults[i].cmd);
+        len += snprintf(out + len, outsz - (size_t)len, "%s\"%s\":%.1f", i ? "," : "",
+                        k_mults[i].cmd, p && p->on ? p->mult : 1.0f);
+    }
+    if (len >= 0 && (size_t)len < outsz)
+        snprintf(out + len, outsz - (size_t)len, "}");
 }
 
 

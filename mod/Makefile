@@ -1,9 +1,10 @@
 # libcncmod —— arm64 注入 dylib
 CC      := clang
-CFLAGS  := -std=c11 -Wall -Wextra -O2 -fPIC -arch arm64
-LDFLAGS := -shared -arch arm64
+TARGET  := -arch arm64 -mmacosx-version-min=12.0
+CFLAGS  := -std=c11 -Wall -Wextra -O2 -fPIC $(TARGET) -MMD -MP
+LDFLAGS := -shared $(TARGET)
 SRC     := $(wildcard src/*.c)
-OBJ     := $(SRC:.c=.o)
+OBJ     := $(patsubst src/%.c,build/obj/%.o,$(SRC))
 OUT     := build/libcncmod.dylib
 
 all: $(OUT)
@@ -12,10 +13,13 @@ $(OUT): $(OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $^
 
-%.o: %.c
+build/obj/%.o: src/%.c
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+-include $(OBJ:.o=.d)
+
 clean:
-	rm -f $(OBJ) $(OUT)
+	rm -rf build
 
 .PHONY: all clean

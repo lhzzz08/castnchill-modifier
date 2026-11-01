@@ -3,10 +3,8 @@
 
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 cnc_il2cpp_t g_il2;
 
@@ -23,51 +21,31 @@ static void *find_gameassembly(void) {
     return NULL;
 }
 
+/* 先绑到局部表，全部必需符号齐了才提交到 g_il2：
+ * 半途失败不能留下 ga 非空而函数指针为 NULL 的状态（之后会被当成已绑定直接调用） */
 #define BIND(field, name)                                                   \
     do {                                                                    \
-        g_il2.field = (__typeof__(g_il2.field))dlsym(g_il2.ga, name);       \
-        if (!g_il2.field) {                                                 \
-            cnc_log("resolver: 缺少导出符号 %s", name);                       \
+        t.field = (__typeof__(t.field))dlsym(ga, name);                     \
+        if (!t.field) {                                                     \
+            if (!logged) cnc_log("resolver: 缺少导出符号 %s", name);           \
+            logged = true;                                                  \
             return false;                                                   \
         }                                                                   \
     } while (0)
 
 #define BIND_OPT(field, name)                                               \
     do {                                                                    \
-        g_il2.field = (__typeof__(g_il2.field))dlsym(g_il2.ga, name);       \
-        if (!g_il2.field) cnc_log("resolver: 可选符号缺失 %s", name);         \
+        t.field = (__typeof__(t.field))dlsym(ga, name);                     \
+        if (!t.field) cnc_log("resolver: 可选符号缺失 %s", name);             \
     } while (0)
 
-void **cnc_find_instances(void *klass, size_t *n) {
-    *n = 0;
-    if (!g_il2.class_get_type || !g_il2.type_get_object) return NULL;
-    void *type_obj = g_il2.type_get_object(g_il2.class_get_type(klass));
-    void *res = cnc_find_class("UnityEngine", "Resources");
-    if (!type_obj || !res) return NULL;
-    void *m = g_il2.class_get_method_from_name(res, "FindObjectsOfTypeAll", 1);
-    if (!m) return NULL;
-    void *exc = NULL;
-    void *params[1] = {type_obj};
-    void *arr = g_il2.runtime_invoke(m, NULL, params, &exc);
-    if (exc || !arr) {
-        cnc_log("resolver: FindObjectsOfTypeAll 异常 %p", exc);
-        return NULL;
-    }
-    size_t len = g_il2.array_length(arr);
-    /* Il2CppArray: [klass 8][monitor 8][max_length 8][vector 数据 @0x20] */
-    void **out = malloc((len ? len : 1) * sizeof(void *));
-    if (!out) return NULL;
-    for (size_t i = 0; i < len; i++)
-        out[i] = *(void **)((char *)arr + 0x20 + i * sizeof(void *));
-    *n = len;
-    return out;
-}
-
 bool cnc_il2cpp_bind(void) {
+    static bool logged = false;
     if (g_il2.ga) return true;
-    g_il2.ga = find_gameassembly();
-    if (!g_il2.ga) return false;
+    void *ga = find_gameassembly();
+    if (!ga) return false;
 
+    cnc_il2cpp_t t = {0};
     BIND(domain_get, "il2cpp_domain_get");
     BIND(domain_get_assemblies, "il2cpp_domain_get_assemblies");
     BIND(thread_attach, "il2cpp_thread_attach");
@@ -86,40 +64,77 @@ bool cnc_il2cpp_bind(void) {
     BIND_OPT(array_length, "il2cpp_array_length");
     BIND_OPT(field_get_type, "il2cpp_field_get_type");
     BIND_OPT(class_from_il2cpp_type, "il2cpp_class_from_il2cpp_type");
+    t.ga = ga;
+    g_il2 = t;
     return true;
-}
-
-bool cnc_il2cpp_wait_ready(int timeout_ms) {
-    for (int waited = 0; waited <= timeout_ms; waited += 50) {
-        if (cnc_il2cpp_bind() && g_il2.domain_get && g_il2.domain_get()) {
-            g_il2.domain = g_il2.domain_get();
-            size_t n = 0;
-            if (g_il2.domain_get_assemblies)
-                g_il2.domain_get_assemblies(g_il2.domain, &n);
-            g_il2.assembly_count = n;
-            return true;
-        }
-        usleep(50 * 1000);
-    }
-    return false;
 }
 
 void *cnc_il2cpp_attach(void) {
     return g_il2.thread_attach ? g_il2.thread_attach(g_il2.domain) : NULL;
 }
 
+/* 类查找缓存：每次遍历全部程序集代价不小，而 tick 每 2s 要查几十次。
+ * 只缓存命中（类一经加载永不卸载）；只在主线程访问，无需加锁。 */
+#define CLASS_CACHE_MAX 96
+
+static struct {
+    char ns[48];
+    char name[64];
+    void *klass;
+} g_class_cache[CLASS_CACHE_MAX];
+static int g_class_cache_n;
+
 void *cnc_find_class(const char *ns, const char *name) {
     if (!g_il2.domain) return NULL;
+    for (int i = 0; i < g_class_cache_n; i++)
+        if (strcmp(g_class_cache[i].name, name) == 0 && strcmp(g_class_cache[i].ns, ns) == 0)
+            return g_class_cache[i].klass;
+
     size_t n = 0;
     void **asms = g_il2.domain_get_assemblies(g_il2.domain, &n);
     if (!asms) return NULL;
-    for (size_t i = 0; i < n; i++) {
+    void *klass = NULL;
+    for (size_t i = 0; i < n && !klass; i++) {
         void *image = g_il2.assembly_get_image(asms[i]);
-        if (!image) continue;
-        void *klass = g_il2.class_from_name(image, ns, name);
-        if (klass) return klass;
+        if (image) klass = g_il2.class_from_name(image, ns, name);
     }
-    return NULL;
+    if (klass && g_class_cache_n < CLASS_CACHE_MAX &&
+        strlen(ns) < sizeof g_class_cache[0].ns && strlen(name) < sizeof g_class_cache[0].name) {
+        snprintf(g_class_cache[g_class_cache_n].ns, sizeof g_class_cache[0].ns, "%s", ns);
+        snprintf(g_class_cache[g_class_cache_n].name, sizeof g_class_cache[0].name, "%s", name);
+        g_class_cache[g_class_cache_n].klass = klass;
+        g_class_cache_n++;
+    }
+    return klass;
+}
+
+void **cnc_find_instances(void *klass, size_t *n) {
+    *n = 0;
+    if (!klass || !g_il2.class_get_type || !g_il2.type_get_object || !g_il2.array_length)
+        return NULL;
+    static void *m_find_all;
+    if (!m_find_all) {
+        void *res = cnc_find_class("UnityEngine", "Resources");
+        if (res) m_find_all = g_il2.class_get_method_from_name(res, "FindObjectsOfTypeAll", 1);
+        if (!m_find_all) return NULL;
+    }
+    void *type_obj = g_il2.type_get_object(g_il2.class_get_type(klass));
+    if (!type_obj) return NULL;
+    void *exc = NULL;
+    void *params[1] = {type_obj};
+    void *arr = g_il2.runtime_invoke(m_find_all, NULL, params, &exc);
+    if (exc || !arr) {
+        cnc_log("resolver: FindObjectsOfTypeAll 异常 %p", exc);
+        return NULL;
+    }
+    size_t len = g_il2.array_length(arr);
+    /* Il2CppArray: [klass 8][monitor 8][bounds 8][max_length 8][vector 数据 @0x20] */
+    void **out = malloc((len ? len : 1) * sizeof(void *));
+    if (!out) return NULL;
+    for (size_t i = 0; i < len; i++)
+        out[i] = *(void **)((char *)arr + 0x20 + i * sizeof(void *));
+    *n = len;
+    return out;
 }
 
 char *cnc_string_to_utf8(void *il2str) {

@@ -8,7 +8,7 @@
 /*
  * IL2CPP 运行时按名解析层。
  * 一切按 命名空间/类/方法名 在运行时解析，仓库禁止出现硬编码偏移 ——
- * 这是修改器扛游戏更新的根本设计（DESIGN.md §5.3）。
+ * 这是修改器扛游戏更新的根本设计。
  */
 
 typedef struct {
@@ -37,6 +37,8 @@ typedef struct {
     void *(*class_from_il2cpp_type)(void *type);
 } cnc_il2cpp_t;
 
+/* 以下全部函数只能在 Unity 主线程调用（见 cnc_mt）。 */
+
 /* 万能实例枚举：Resources.FindObjectsOfTypeAll(Type) 拿某类全部已加载实例。
  * 返回 malloc 的指针数组（调用方 free），*n 为数量，失败返回 NULL。 */
 void **cnc_find_instances(void *klass, size_t *n);
@@ -44,16 +46,13 @@ void **cnc_find_instances(void *klass, size_t *n);
 extern cnc_il2cpp_t g_il2;
 
 /* 找到 GameAssembly.dylib（遍历 dyld 镜像 + RTLD_NOLOAD），解析全部 API 指针。
- * 返回 false 表示 GameAssembly 尚未加载。 */
+ * 返回 false 表示 GameAssembly 尚未加载或缺少必需符号（g_il2 保持全空）。 */
 bool cnc_il2cpp_bind(void);
 
-/* 阻塞等待 IL2CPP 域就绪（游戏启动后很快，上限 timeout_ms）。 */
-bool cnc_il2cpp_wait_ready(int timeout_ms);
-
-/* 把当前线程 attach 到 il2cpp（调用任何 runtime API 前需要）。 */
+/* 把当前线程 attach 到 il2cpp（主线程已由 Unity attach，重复调用无害）。 */
 void *cnc_il2cpp_attach(void);
 
-/* 按 命名空间+类名 在所有程序集镜像里找类，找不到返回 NULL。 */
+/* 按 命名空间+类名 在所有程序集镜像里找类（命中结果缓存），找不到返回 NULL。 */
 void *cnc_find_class(const char *ns, const char *name);
 
 /* 取 UTF-16 的 Il2CppString 内容转为 UTF-8（malloc，调用方 free）。 */

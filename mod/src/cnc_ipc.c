@@ -106,11 +106,17 @@ static void *client_thread(void *arg) {
     int fd = (int)(long)arg;
     char buf[IPC_REQ_MAX];
 
+    /* SO_NOSIGPIPE 必须设成功才能往这个 fd 写：macOS 上对端已断开时 setsockopt
+     * 返回 EINVAL，选项没生效，之后的 write 会让整个游戏进程收到 SIGPIPE 退出。
+     * 设不上说明对端已经走了，直接关掉即可。 */
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one) != 0) {
+        close(fd);
+        return NULL;
+    }
     struct timeval tv = {5, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 
     /* 单连接单命令（面板每次请求短连），够用且免状态机 */
     if (read_line(fd, buf, sizeof buf) > 0 && buf[0]) {

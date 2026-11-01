@@ -253,8 +253,9 @@ enum ModClient {
         let tvLen = socklen_t(MemoryLayout<timeval>.size)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, tvLen)
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, tvLen)
-        var one: Int32 = 1 /* mod 先断开时 write 返回错误而不是 SIGPIPE 杀掉面板 */
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        var one: Int32 = 1 /* mod 先断开时 write 返回错误而不是 SIGPIPE 杀掉面板；设不上就不发 */
+        guard setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size)) == 0
+        else { return nil }
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)

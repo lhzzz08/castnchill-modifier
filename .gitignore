@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# 构建产物
+*.o
+*.d
+mod/build/
+panel/build/
+panel/assets/
+dist/
+
+# Python
+__pycache__/
+*.pyc

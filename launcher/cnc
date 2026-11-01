@@ -1,0 +1,77 @@
+#!/bin/bash
+# cnc —— Cast n Chill 修改器启动器（F05）
+# 流程：版本校验 → Steam 检查 → 存档备份 → 注入启动（DESIGN.md §5.2）
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# 注入模块位置：优先安装布局（组件同目录），其次仓库布局（mod/build/）
+if [ -f "$SCRIPT_DIR/libcncmod.dylib" ]; then
+  MOD_DYLIB="${CNC_MOD_DYLIB:-$SCRIPT_DIR/libcncmod.dylib}"
+else
+  MOD_DYLIB="${CNC_MOD_DYLIB:-$SCRIPT_DIR/../mod/build/libcncmod.dylib}"
+fi
+GAME_ROOT="${CNC_GAME_ROOT:-$HOME/Library/Application Support/Steam/steamapps/common/Cast n Chill}"
+GAME_APP="$GAME_ROOT/Cast n Chill.app"
+GAME_BIN="$GAME_APP/Contents/MacOS/Cast n Chill"
+SAVE_DIR="$HOME/Library/Application Support/Wombat Brawler/Cast n Chill/Journals"
+BACKUP_ROOT="$HOME/.castnchill-modifier/backups"
+SUPPORTED_VERSION="1.3.1(174)"   # 已验证适配的版本；不匹配仅警告不拦截
+
+say() { printf '\033[36m[cnc]\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m[cnc][警告]\033[0m %s\n' "$*"; }
+die() { printf '\033[31m[cnc][错误]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# 1. 前置检查
+[ -x "$GAME_BIN" ] || die "找不到游戏主程序：$GAME_BIN（可用 CNC_GAME_ROOT 覆盖路径）"
+[ -f "$MOD_DYLIB" ] || die "找不到注入模块：$MOD_DYLIB（先在 mod/ 目录 make）"
+
+VER="$(cat "$GAME_ROOT/version.txt" 2>/dev/null)"
+case "$VER" in
+  "$SUPPORTED_VERSION"*) say "游戏版本匹配：$VER" ;;
+  "") warn "读不到 version.txt，跳过版本校验" ;;
+  *) warn "游戏版本 $VER 与已适配版本 $SUPPORTED_VERSION 不一致，功能可能不可用（按名解析会尽量兼容）" ;;
+esac
+
+# 2. Steam 必须在运行（SteamAPI 初始化 + 正版校验走它）
+if ! pgrep -f "Steam.AppBundle/Steam/Contents/MacOS/steam_osx" >/dev/null; then
+  say "Steam 未运行，正在启动…"
+  open -a Steam || die "Steam 启动失败，请手动启动后重试"
+  for _ in $(seq 1 30); do
+    sleep 2
+    pgrep -f "steam_osx" >/dev/null && break
+  done
+  pgrep -f "steam_osx" >/dev/null || die "等待 Steam 超时"
+fi
+
+# 3. 已有实例则拒绝启动（避免误杀进行中的游戏）
+#    注意匹配不能加 $ 锚定：启动参数会跟在可执行名后面
+if pgrep -f "Cast n Chill.app/Contents/MacOS/Cast n Chill( |$)" >/dev/null; then
+  die "游戏已在运行，请先退出再由 cnc 启动"
+fi
+
+# 4. 存档备份（F04）
+if [ -d "$SAVE_DIR" ]; then
+  TS="$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$BACKUP_ROOT/$TS"
+  cp "$SAVE_DIR"/journal* "$BACKUP_ROOT/$TS/" 2>/dev/null
+  say "存档已备份 → $BACKUP_ROOT/$TS"
+  # 只保留最近 30 份
+  ls -1dt "$BACKUP_ROOT"/2025* "$BACKUP_ROOT"/2026* 2>/dev/null | tail -n +31 | xargs rm -rf 2>/dev/null
+fi
+
+# 4.5 自愈清理：强退/崩溃残留会让下次启动卡死或弹恢复窗（实测）
+#     崩溃报告归档保留（诊断证据），不直接删；mod 日志跨会话追加不删
+CRASH_DIR="$HOME/.castnchill-modifier/crashes"
+mkdir -p "$CRASH_DIR"
+mv "$HOME/Library/Logs/DiagnosticReports/Cast n Chill"*.ips "$CRASH_DIR/" 2>/dev/null
+rm -rf "$HOME/Library/Saved Application State/com.wombatbrawler.castnchill.savedState" 2>/dev/null
+
+# 5. 注入启动（SteamAppId/SteamGameId 为 M0 实测必需，见 DESIGN.md §5.2）
+#    -ApplePersistenceIgnoreState：跳过窗口恢复，避免崩溃后卡死在
+#    "是否恢复窗口"模态框（实测会永久阻塞引擎初始化）
+# mod 日志跨会话追加保留（崩溃取证）
+say "注入启动：$MOD_DYLIB"
+export SteamAppId=3483740
+export SteamGameId=3483740
+export DYLD_INSERT_LIBRARIES="$MOD_DYLIB"
+exec "$GAME_BIN" -ApplePersistenceIgnoreState YES

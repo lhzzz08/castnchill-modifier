@@ -24,7 +24,7 @@
 ## 从源码构建
 
 ```bash
-git clone <本仓库地址>
+git clone https://github.com/lhzzz08/castnchill-modifier.git
 cd castnchill-modifier
 make        # 编译注入模块 libcncmod.dylib + 面板 CNCPanel.app
 make dmg    # （可选）打包成 CastNChillTrainer.dmg 安装镜像
@@ -99,4 +99,8 @@ DYLD_INSERT_LIBRARIES 注入（游戏 ad-hoc 签名无 Hardened Runtime，无需
 
 ## 免责声明
 
-本项目仅供学习研究。使用本修改器产生的任何游戏内后果（成就、云存档等）由使用者自行承担。请勿用于任何多人或商业场景。
+本项目仅供学习研究，与《Cast n Chill》的开发商及发行商无任何关联。使用本修改器产生的任何游戏内后果（成就、云存档等）由使用者自行承担。请勿用于任何多人或商业场景。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 lhz。游戏《Cast n Chill》及其素材的版权归其开发商所有，本项目不含任何游戏资源。

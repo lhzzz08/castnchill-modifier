@@ -34,6 +34,8 @@ make dmg    # （可选）打包成 CastNChillTrainer.dmg 安装镜像
 
 **方式 A（推荐）**：`make dmg` → 挂载 dmg → 把 `CNCPanel.app` 拖进「应用程序」→ 双击 dmg 里的「安装组件.command」
 
+> 本项目只做 ad-hoc 签名，没有 Apple 公证。从网上下载的 dmg 首次打开「安装组件.command」时，请右键 → 打开；安装脚本会自动去掉组件和 `/Applications/CNCPanel.app` 的隔离标记。
+
 **方式 B（仓库直用）**：直接运行仓库里的 `launcher/cnc`
 
 ## 日常使用（三步）
@@ -47,12 +49,32 @@ make dmg    # （可选）打包成 CastNChillTrainer.dmg 安装镜像
 ## 存档编辑器（离线，先退游戏）
 
 ```bash
-cnc_save.py show   <存档>                        # 查看现状
-cnc_save.py cash   <存档> set 100000             # 改钱
-cnc_save.py unlock <存档> all                    # 全鱼图鉴+全外观
-cnc_save.py catch  <存档> arctic-char 150        # 指定鱼入包
-cnc_save.py restore <存档> <备份>                 # 回滚
+cnc_save.py show   <存档>                              # 查看现状
+cnc_save.py cash   <存档> add 50000                    # 加钱（负数为扣钱）
+cnc_save.py cash   <存档> set 100000 --current 12345   # 设为指定金额（需给出当前金额）
+cnc_save.py unlock <存档> all                          # 全鱼图鉴+全外观（已有的跳过，穿戴不变）
+cnc_save.py catch  <存档> arctic-char 150              # 指定鱼入包
+cnc_save.py restore <存档> <备份>                       # 回滚（回滚前自动备份当前存档）
 ```
+
+游戏运行中编辑器会拒绝写入（游戏会覆盖改动），确需强制加 `--force`。
+
+## 命令行直控
+
+面板之外，任何终端都能通过 Unix socket 发命令：`printf 'cash.add 50000\n' | nc -U /tmp/cnc-mod-$(id -u).sock`
+
+| 命令 | 说明 |
+|---|---|
+| `ping` / `state.get` | 探活 / 总状态（含各开关、倍率） |
+| `cash.get` · `cash.add <n>` · `cash.set <n>` | 金钱（单次改动 ≤10 亿） |
+| `speed.get` · `speed.set <x>` | 游戏加速 0.25–16× |
+| `sell.all` · `sell.mult <x>` · `sell.instant on\|off` | 一键卖鱼 / 售价倍率 1–100× / 即时码头销售 |
+| `fish.stamina` `fish.bite` `fish.trophy` `line.safe` `player.stamina` `cast.super` + `on\|off` | 钓鱼增强开关 |
+| `boat.fast <x>` · `ice.fast <x>` · `reel.fast <x>` | 船速 1–10× / 冰面 1–10× / 收线 1–20× |
+| `time.get` · `time.set <分钟>` | 游戏内时间（0–1440） |
+| `storage.max` · `save.now` · `ids.dump` | 船存拉满 / 立即存盘 / 导出资产 ID |
+
+游戏更新后没解析到的功能会返回 `unsupported`，其余功能照常可用。
 
 ## 故障排查
 
@@ -64,7 +86,15 @@ cnc_save.py restore <存档> <备份>                 # 回滚
 
 ## 技术架构
 
-DYLD_INSERT_LIBRARIES 注入（游戏 ad-hoc 签名无 Hardened Runtime，无需 sudo/重签名）→ IL2CPP 运行时按名解析（零硬编码偏移，扛游戏更新）→ GCD 主队列编组全部托管调用 → Unix socket JSON 协议驱动面板。详见 `DESIGN.md`。
+DYLD_INSERT_LIBRARIES 注入（游戏 ad-hoc 签名无 Hardened Runtime，无需 sudo/重签名）→ IL2CPP 运行时按名解析（零硬编码偏移，扛游戏更新）→ GCD 主队列编组全部托管调用 → Unix socket JSON 协议驱动面板。
+
+| 目录 | 内容 |
+|---|---|
+| `mod/` | 注入模块 `libcncmod.dylib`（C）：`cnc_resolver` 按名解析 IL2CPP、`cnc_mt` 主线程调度、`cnc_ipc` socket 服务、`cnc_game` 各功能 |
+| `panel/` | SwiftUI 面板 `CNCPanel.app`（swiftc 直编，无 Xcode 工程） |
+| `launcher/cnc` | 启动器：版本校验、存档备份、注入启动 |
+| `save-tools/cnc_save.py` | 离线存档编辑器 |
+| `scripts/make_dmg.sh` | 打包 dmg |
 
 ## 免责声明
 

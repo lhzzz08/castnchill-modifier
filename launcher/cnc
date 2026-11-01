@@ -1,6 +1,6 @@
 #!/bin/bash
 # cnc —— Cast n Chill 修改器启动器（F05）
-# 流程：版本校验 → Steam 检查 → 存档备份 → 注入启动（DESIGN.md §5.2）
+# 流程：版本校验 → Steam 检查 → 存档备份 → 注入启动
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -53,10 +53,16 @@ fi
 if [ -d "$SAVE_DIR" ]; then
   TS="$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$BACKUP_ROOT/$TS"
-  cp "$SAVE_DIR"/journal* "$BACKUP_ROOT/$TS/" 2>/dev/null
-  say "存档已备份 → $BACKUP_ROOT/$TS"
-  # 只保留最近 30 份
-  ls -1dt "$BACKUP_ROOT"/2025* "$BACKUP_ROOT"/2026* 2>/dev/null | tail -n +31 | xargs rm -rf 2>/dev/null
+  cp -p "$SAVE_DIR"/journal* "$BACKUP_ROOT/$TS/" 2>/dev/null
+  if [ -n "$(ls -A "$BACKUP_ROOT/$TS" 2>/dev/null)" ]; then
+    say "存档已备份 → $BACKUP_ROOT/$TS"
+  else
+    rmdir "$BACKUP_ROOT/$TS" 2>/dev/null   # 空目录不占 30 份配额
+    warn "存档目录里没有 journal 文件，本次未备份"
+  fi
+  # 只保留最近 30 份（目录名即时间戳，按名字倒序 = 按时间倒序；路径含空格也安全）
+  ls -1d "$BACKUP_ROOT"/20[0-9][0-9][0-9][0-9][0-9][0-9]-* 2>/dev/null | sort -r | tail -n +31 |
+    while IFS= read -r old; do rm -rf -- "$old"; done
 fi
 
 # 4.5 自愈清理：强退/崩溃残留会让下次启动卡死或弹恢复窗（实测）
@@ -66,7 +72,7 @@ mkdir -p "$CRASH_DIR"
 mv "$HOME/Library/Logs/DiagnosticReports/Cast n Chill"*.ips "$CRASH_DIR/" 2>/dev/null
 rm -rf "$HOME/Library/Saved Application State/com.wombatbrawler.castnchill.savedState" 2>/dev/null
 
-# 5. 注入启动（SteamAppId/SteamGameId 为 M0 实测必需，见 DESIGN.md §5.2）
+# 5. 注入启动（SteamAppId/SteamGameId 为 M0 实测必需）
 #    -ApplePersistenceIgnoreState：跳过窗口恢复，避免崩溃后卡死在
 #    "是否恢复窗口"模态框（实测会永久阻塞引擎初始化）
 # mod 日志跨会话追加保留（崩溃取证）

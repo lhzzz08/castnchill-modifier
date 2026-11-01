@@ -242,13 +242,19 @@ struct ModResponse {
 enum ModClient {
     static var socketPath: String { "/tmp/cnc-mod-\(getuid()).sock" }
 
-    static func send(_ command: String, timeoutSec: Double = 2) -> ModResponse? {
+    /// 阻塞调用，只能在后台线程用（见 request）
+    static func send(_ command: String, timeoutSec: Double) -> ModResponse? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
 
-        var tv = timeval(tv_sec: Int(timeoutSec), tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var tv = timeval(tv_sec: Int(timeoutSec),
+                         tv_usec: Int32((timeoutSec - Double(Int(timeoutSec))) * 1_000_000))
+        let tvLen = socklen_t(MemoryLayout<timeval>.size)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, tvLen)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, tvLen)
+        var one: Int32 = 1 /* mod 先断开时 write 返回错误而不是 SIGPIPE 杀掉面板 */
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -268,14 +274,16 @@ enum ModClient {
         guard connectResult == 0 else { return nil }
 
         let req = (command + "\n").utf8CString
-        req.withUnsafeBufferPointer { buf in
+        let sentAll = req.withUnsafeBufferPointer { buf -> Bool in
             var sent = 0
             while sent < buf.count - 1 {
                 let n = write(fd, buf.baseAddress! + sent, buf.count - 1 - sent)
-                if n <= 0 { return }
+                if n <= 0 { return false }
                 sent += n
             }
+            return true
         }
+        guard sentAll else { return nil }
 
         var data = [UInt8]()
         var chunk = [UInt8](repeating: 0, count: 1024)
@@ -297,9 +305,25 @@ enum ModClient {
         }
         return ModResponse(raw: line, json: json)
     }
+
+    private static let queue = DispatchQueue(label: "cnc.panel.ipc", qos: .userInitiated,
+                                             attributes: .concurrent)
+
+    /// 在后台队列发命令，不阻塞界面
+    static func request(_ command: String, timeoutSec: Double) async -> ModResponse? {
+        await withCheckedContinuation { cont in
+            queue.async { cont.resume(returning: send(command, timeoutSec: timeoutSec)) }
+        }
+    }
 }
 
-// MARK: - 状态模型（逻辑不变）
+// MARK: - 状态模型
+
+/// 面板上的开关（命令名 → 显示名），顺序即界面顺序
+let kToggles: [(cmd: String, title: String)] = [
+    ("fish.stamina", "秒赢对决"), ("fish.bite", "即时上钩"), ("line.safe", "不断之线"),
+    ("player.stamina", "无限体力"), ("cast.super", "超级投掷"),
+]
 
 @MainActor
 final class PanelModel: ObservableObject {
@@ -312,87 +336,109 @@ final class PanelModel: ObservableObject {
     @Published var speed = 1.0
     @Published var logLines: [String] = []
     @Published var cashInput = ""
-    // M4/M5
-    @Published var fishStamina = false
-    @Published var fishBite = false
-    @Published var lineSafe = false
-    @Published var playerStamina = false
-    @Published var castSuper = false
+    // M4/M5：开关与倍率以 mod 的 state.get 为准（面板重启/命令失败都不会和游戏不同步）
+    @Published var toggles: [String: Bool] = [:]
     @Published var boatMult = 1.0
 
     private var timer: Timer?
-    private var retryTimer: Timer?
+    private var refreshing = false
+    private var pendingCommands = 0
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 
     init() {
-        /* 状态轮询常开（本地 socket 查询，开销可忽略）：面板数据永远实时，
-         * 不再需要"刷新状态"按钮和"自动刷新"开关 */
+        /* 状态轮询常开（本地 socket 查询，在后台队列执行，不卡界面）；
+         * 断开时同样靠它自动重连 */
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
     }
 
+    func isOn(_ cmd: String) -> Bool { toggles[cmd] ?? false }
+
     func log(_ s: String) {
-        let f = Foundation.DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        logLines.insert("\(f.string(from: Date()))  \(s)", at: 0)
+        logLines.insert("\(Self.timeFormatter.string(from: Date()))  \(s)", at: 0)
         if logLines.count > 200 { logLines.removeLast(logLines.count - 200) }
     }
 
     func refresh() {
-        guard let resp = ModClient.send("state.get", timeoutSec: 1.5) else {
+        guard !refreshing else { return }
+        refreshing = true
+        Task {
+            let resp = await ModClient.request("state.get", timeoutSec: 1.5)
+            refreshing = false
+            apply(resp)
+        }
+    }
+
+    private func apply(_ resp: ModResponse?) {
+        guard let resp else {
             connected = false
             statusDetail = "游戏未启动或未注入"
-            scheduleRetry()
             return
         }
-        if resp.ok {
-            connected = true
-            statusDetail = ""
-            retryTimer?.invalidate(); retryTimer = nil
-            gameVersion = resp.string("game_version")
-            assemblies = resp.string("assemblies")
-            modVersion = resp.string("mod_version")
-            if let c = resp.json?["cash"] as? NSNumber { cash = c.intValue < 0 ? "未进档" : c.stringValue }
-            if let s = resp.json?["speed"] as? NSNumber { speed = s.doubleValue }
-        } else {
+        guard resp.ok else {
             connected = false
             let err = resp.string("error")
             switch err {
             case "booting": statusDetail = "游戏启动中，自动重试…"
             case "main-thread timeout", "main-thread unavailable":
                 statusDetail = "主线程未就绪，自动重试…"
-            default: statusDetail = err.isEmpty ? "未知错误" : err
+            default: statusDetail = err == "—" ? "未知错误" : err
             }
-            scheduleRetry()
-        }
-    }
-
-    private func scheduleRetry() {
-        guard retryTimer == nil else { return }
-        retryTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self, !self.connected else { return }
-                self.retryTimer = nil
-                self.refresh()
-            }
-        }
-    }
-
-    private func run(_ cmd: String, label: String) {
-        guard let resp = ModClient.send(cmd) else {
-            log("\(label) ✘ 连接失败")
             return
         }
-        log("\(label) → \(resp.raw)")
-        refresh()
+        connected = true
+        statusDetail = ""
+        gameVersion = resp.string("game_version")
+        assemblies = resp.string("assemblies")
+        modVersion = resp.string("mod_version")
+        if let c = resp.json?["cash"] as? NSNumber { cash = c.intValue < 0 ? "未进档" : c.stringValue }
+        /* 有命令在途时不覆盖可操作控件，避免开关/滑杆闪回旧值 */
+        guard pendingCommands == 0 else { return }
+        if let s = resp.json?["speed"] as? NSNumber { speed = min(16, max(1, s.doubleValue)) }
+        if let t = resp.json?["toggles"] as? [String: Bool] { toggles = t }
+        if let m = resp.json?["mults"] as? [String: NSNumber], let b = m["boat.fast"] {
+            boatMult = b.doubleValue
+        }
+    }
+
+    /* 操作命令可能较慢（卖鱼 + 落盘），超时放宽到 10s（mod 侧主线程等待上限 8s） */
+    private func run(_ cmd: String, label: String) {
+        pendingCommands += 1
+        Task {
+            let resp = await ModClient.request(cmd, timeoutSec: 10)
+            pendingCommands -= 1
+            if let resp {
+                log("\(label) \(resp.ok ? "→" : "✘") \(resp.raw)")
+            } else {
+                log("\(label) ✘ 连接失败")
+            }
+            refresh()
+        }
     }
 
     func cashAdd(_ n: Int) { run("cash.add \(n)", label: "加钱 \(n)") }
-    func cashSet() { run("cash.set \(Int(cashInput) ?? 0)", label: "设钱 \(cashInput)") }
+    func cashSet() {
+        let text = cashInput.trimmingCharacters(in: .whitespaces)
+        guard let n = Int(text), n >= 0 else {
+            log("设钱 ✘ 金额无效：「\(cashInput)」（请输入非负整数）")
+            return
+        }
+        run("cash.set \(n)", label: "设钱 \(n)")
+    }
     func speedApply() { run(String(format: "speed.set %.2f", speed), label: String(format: "速度 %.1f×", speed)) }
-    func speedReset() { run("speed.set 1", label: "速度还原") }
+    func speedReset() { speed = 1; run("speed.set 1", label: "速度还原") }
     func sellAll() { run("sell.all", label: "一键卖鱼") }
-    func m4Toggle(_ name: String, _ on: Bool) { run("\(name) \(on ? "on" : "off")", label: "\(name) \(on ? "开" : "关")") }
+    func m4Toggle(_ name: String) {
+        let on = !isOn(name)
+        toggles[name] = on /* 先显示目标状态；结果以下一次 state.get 为准 */
+        run("\(name) \(on ? "on" : "off")", label: "\(name) \(on ? "开" : "关")")
+    }
     func m4Mult(_ name: String, _ v: Double) { run(String(format: "%@ %.1f", name, v), label: String(format: "%@ %.1f×", name, v)) }
 }
 
@@ -430,13 +476,14 @@ struct ContentView: View {
                 PixelSection(title: "▚ 钓鱼增强") {
                     VStack(spacing: 6) {
                         HStack(spacing: 6) {
-                            PixelCheck(title: "秒赢对决", on: model.fishStamina) { model.fishStamina.toggle(); model.m4Toggle("fish.stamina", model.fishStamina) }
-                            PixelCheck(title: "即时上钩", on: model.fishBite) { model.fishBite.toggle(); model.m4Toggle("fish.bite", model.fishBite) }
-                            PixelCheck(title: "不断之线", on: model.lineSafe) { model.lineSafe.toggle(); model.m4Toggle("line.safe", model.lineSafe) }
+                            ForEach(kToggles.prefix(3), id: \.cmd) { t in
+                                PixelCheck(title: t.title, on: model.isOn(t.cmd)) { model.m4Toggle(t.cmd) }
+                            }
                         }
                         HStack(spacing: 6) {
-                            PixelCheck(title: "无限体力", on: model.playerStamina) { model.playerStamina.toggle(); model.m4Toggle("player.stamina", model.playerStamina) }
-                            PixelCheck(title: "超级投掷", on: model.castSuper) { model.castSuper.toggle(); model.m4Toggle("cast.super", model.castSuper) }
+                            ForEach(kToggles.dropFirst(3), id: \.cmd) { t in
+                                PixelCheck(title: t.title, on: model.isOn(t.cmd)) { model.m4Toggle(t.cmd) }
+                            }
                         }
                     }
                 }
@@ -497,6 +544,10 @@ struct ContentView: View {
             /* 折叠头：点击展开/收起；中间显示最近一条操作记录 */
             Button {
                 logExpanded.toggle()
+                /* 直接发通知（两参数 onChange 需要 macOS 14，本面板支持 macOS 12+） */
+                NotificationCenter.default.post(
+                    name: PanelAppDelegate.cncToggleLog, object: logExpanded
+                )
             } label: {
                 HStack(spacing: 8) {
                     Text(logExpanded ? "运行日志 ▾" : "运行日志 ▸")
@@ -515,11 +566,6 @@ struct ContentView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .onChange(of: logExpanded) { _, expanded in
-                NotificationCenter.default.post(
-                    name: PanelAppDelegate.cncToggleLog, object: expanded
-                )
-            }
             if logExpanded {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
@@ -602,17 +648,24 @@ final class PanelAppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         window = w
 
-        /* 恢复上次退出前的窗口位置 */
+        /* 恢复上次退出前的窗口位置；那块屏幕已断开（外接显示器拔掉）时保持居中，
+         * 否则窗口会落在看不见的地方 */
         if let s = UserDefaults.standard.string(forKey: "WinOrigin") {
             let p = s.split(separator: ",").compactMap { Double($0) }
-            if p.count == 2 { w.setFrameTopLeftPoint(NSPoint(x: p[0], y: p[1])) }
+            if p.count == 2 {
+                let tl = NSPoint(x: p[0], y: p[1])
+                let titleBar = NSRect(x: tl.x, y: tl.y - 30, width: w.frame.width, height: 30)
+                if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(titleBar) }) {
+                    w.setFrameTopLeftPoint(tl)
+                }
+            }
         }
         NotificationCenter.default.addObserver(
             forName: NSWindow.didMoveNotification, object: w, queue: .main
-        ) { _ in self.saveOrigin() }
+        ) { [weak self] _ in self?.saveOrigin() }
         NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification, object: w, queue: .main
-        ) { _ in self.saveOrigin() }
+        ) { [weak self] _ in self?.saveOrigin() }
 
         /* 日志展开/收起 → 窗口高度随之增减（锚定左上角）。
          * 展开增量 = 日志框 64 + 内边距 12 + 间距 6 ≈ 82pt */

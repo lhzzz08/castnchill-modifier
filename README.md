@@ -10,7 +10,7 @@
 |---|---|
 | 现金 | 大数字显示 · +1万/+10万 · 精确设定 |
 | 卖鱼 | 一键卖出全部渔获（任何位置，自动落盘） |
-| 钓鱼增强 | 秒赢对决（战斗 0.05s）· 即时上钩（咬钩率 100%）· 不断之线 · 无限体力（划船/走路/破冰）· 超级投掷 |
+| 钓鱼增强 | 不断之线 · 超级投掷 |
 | 速度 | 游戏加速 1–16× · 船速 1–10×（含放置闲逛/码头走路） |
 | 存档编辑器 | 离线修改金钱 / 解锁全鱼图鉴 / 全外观（独立工具） |
 | 快捷键 | Cmd+Q 退出 · Cmd+W 关窗 · Cmd+M 最小化（位置记忆） |
@@ -69,7 +69,8 @@ cnc_save.py restore <存档> <备份>                       # 回滚（回滚前
 | `cash.get` · `cash.add <n>` · `cash.set <n>` | 金钱（单次改动 ≤10 亿） |
 | `speed.get` · `speed.set <x>` | 游戏加速 0.25–16× |
 | `sell.all` · `sell.mult <x>` · `sell.instant on\|off` | 一键卖鱼 / 售价倍率 1–100× / 即时码头销售 |
-| `fish.stamina` `fish.bite` `fish.trophy` `line.safe` `player.stamina` `cast.super` + `on\|off` | 钓鱼增强开关 |
+| `line.safe` `cast.super` + `on\|off` | 钓鱼增强开关（不断之线 / 超级投掷） |
+| `fish.trophy on\|off` | 必出奖杯尺寸（面板未露出） |
 | `boat.fast <x>` · `ice.fast <x>` · `reel.fast <x>` | 船速 1–10× / 冰面 1–10× / 收线 1–20× |
 | `time.get` · `time.set <分钟>` | 游戏内时间（0–1440） |
 | `storage.max` · `save.now` · `ids.dump` | 船存拉满 / 立即存盘 / 导出资产 ID |

@@ -322,8 +322,7 @@ enum ModClient {
 
 /// 面板上的开关（命令名 → 显示名），顺序即界面顺序
 let kToggles: [(cmd: String, title: String)] = [
-    ("fish.stamina", "秒赢对决"), ("fish.bite", "即时上钩"), ("line.safe", "不断之线"),
-    ("player.stamina", "无限体力"), ("cast.super", "超级投掷"),
+    ("line.safe", "不断之线"), ("cast.super", "超级投掷"),
 ]
 
 @MainActor
@@ -475,16 +474,9 @@ struct ContentView: View {
                     Button("一键卖出") { model.sellAll() }.buttonStyle(PixelButtonStyle(tone: .yellow))
                 }
                 PixelSection(title: "▚ 钓鱼增强") {
-                    VStack(spacing: 6) {
-                        HStack(spacing: 6) {
-                            ForEach(kToggles.prefix(3), id: \.cmd) { t in
-                                PixelCheck(title: t.title, on: model.isOn(t.cmd)) { model.m4Toggle(t.cmd) }
-                            }
-                        }
-                        HStack(spacing: 6) {
-                            ForEach(kToggles.dropFirst(3), id: \.cmd) { t in
-                                PixelCheck(title: t.title, on: model.isOn(t.cmd)) { model.m4Toggle(t.cmd) }
-                            }
+                    HStack(spacing: 6) {
+                        ForEach(kToggles, id: \.cmd) { t in
+                            PixelCheck(title: t.title, on: model.isOn(t.cmd)) { model.m4Toggle(t.cmd) }
                         }
                     }
                 }
@@ -628,7 +620,7 @@ final class PanelAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let w = NSWindow(
-            contentRect: NSRect(x: 160, y: 160, width: 470, height: 530),
+            contentRect: NSRect(x: 160, y: 160, width: 470, height: 498),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false
         )

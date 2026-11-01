@@ -406,45 +406,6 @@ static int patch_asset_field_i(patch_t *p, const char *cls, const char *field, i
     return changed;
 }
 
-/* FloatRange 等引用类型字段的安全写入：
- * 字段存的是对象指针（FloatRange 是 class 不是 struct！直接写指针位置 = 崩溃，
- * 2026-10-29 实锤：duration 被写成 0.05 后游戏解引用 0x3d4ccccd... 段错误）。
- * 正确流程：field_get_type 拿字段类型类 → 解引用父实例里的指针得到对象 →
- * 在对象内部的 min/max 字段写值。 */
-static int patch_asset_field2(patch_t *p, const char *cls, const char *field, float val) {
-    void *klass = cnc_find_class("Game", cls);
-    if (!klass) return -1;
-    void *fld = g_il2.class_get_field_from_name(klass, field);
-    if (!fld) return -2;
-    int off = g_il2.field_get_offset(fld);
-
-    void *ik = NULL;
-    if (g_il2.field_get_type && g_il2.class_from_il2cpp_type) {
-        void *ft = g_il2.field_get_type(fld);
-        if (ft) ik = g_il2.class_from_il2cpp_type(ft);
-    }
-    if (!ik) return -3;
-    void *fmin = g_il2.class_get_field_from_name(ik, "min");
-    void *fmax = g_il2.class_get_field_from_name(ik, "max");
-    if (!fmin || !fmax) return -4;
-    int omin = g_il2.field_get_offset(fmin);
-    int omax = g_il2.field_get_offset(fmax);
-
-    size_t n = 0;
-    void **insts = instances(klass, &n);
-    if (!insts) return -5;
-    int changed = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (!insts[i]) continue;
-        void *rangeobj = *(void **)((char *)insts[i] + off); /* 解引用字段指针 */
-        if (!rangeobj) continue;
-        prec_write(p, rangeobj, omin, 's', val);
-        prec_write(p, rangeobj, omax, 's', val);
-        changed++;
-    }
-    return changed;
-}
-
 /* v2 核心：链式嵌套路径（父类 = ScriptableObject 资产/单例，嵌套对象是父实例的字段）。
  * 嵌套类类型用 il2cpp_field_get_type → il2cpp_class_from_il2cpp_type 定位。 */
 static int patch_nested(patch_t *p, const char *parent_cls, const char *parent_field,
@@ -480,37 +441,12 @@ static int patch_nested(patch_t *p, const char *parent_cls, const char *parent_f
     return changed;
 }
 
-static void apply_fish_stamina(void) {
-    patch_t *p = patch_get("fish.stamina");
-    patch_asset_field_i(p, "FishData", "stamina", 1);
-    /* 真靶点：FishFightActionData.duration（FloatRange）注释明示
-     * "fight 时长 = duration × 体力倍率" —— 直接把区间归 0.05 秒 */
-    patch_asset_field2(p, "FishFightActionData", "duration", 0.05f);
-}
-
-static void apply_fish_bite(void) {
-    patch_t *p = patch_get("fish.bite");
-    patch_asset_field_i(p, "FishChaseActionData", "commonNibbleToHookRatio", 1);
-    patch_asset_field_i(p, "FishChaseActionData", "bonusNibbleToHookRatio", 1);
-    patch_asset_field(p, "FishChaseActionData", "attract", 's', 100.f);
-    /* chaseDuration = 鱼愿意追饵的时长：必须加大（v2 误设 0.1 反而让鱼秒失去兴趣） */
-    patch_asset_field(p, "FishChaseActionData", "chaseDuration", 's', 60.f);
-}
-
 static void apply_line_safe(void) {
     patch_t *p = patch_get("line.safe");
     /* v3：绝对值 86400 秒 —— 连续满张力一整天才会断，实际不可能；
      * ×10 在大鱼长拉锯下仍可能断 */
     patch_asset_field(p, "FishingLineConfig", "breakDelay", 's', 86400.f);
     patch_asset_field(p, "FishingLineConfig", "tooBigBreakDelay", 's', 86400.f);
-}
-
-static void apply_player_stamina(void) {
-    patch_t *p = patch_get("player.stamina");
-    patch_nested(p, "GameplayConfig", "stamina", "rowDrainRate", 's', 0.f);
-    patch_nested(p, "GameplayConfig", "stamina", "walkDrainRate", 's', 0.f);
-    patch_nested(p, "GameplayConfig", "stamina", "breakIceCost", 's', 0.f);
-    patch_nested(p, "GameplayConfig", "stamina", "recoveryRate", 's', 100.f);
 }
 
 static void apply_cast_super(void) {
@@ -540,10 +476,7 @@ static atomic_bool g_m4_tick_on = false;
 static atomic_uint g_m4_gen;
 static atomic_bool g_m4_pending;
 
-static void apply_fish_stamina(void);
-static void apply_fish_bite(void);
 static void apply_line_safe(void);
-static void apply_player_stamina(void);
 static void apply_cast_super(void);
 static void apply_boat_fast(void);
 static void apply_reel_fast(void);
@@ -554,10 +487,7 @@ static void m4_apply_all(void *unused) {
     atomic_store(&g_m4_pending, false);
     if (!atomic_load(&g_m4_tick_on)) return;
     patch_t *p;
-    if ((p = patch_find("fish.stamina")) && p->on) apply_fish_stamina();
-    if ((p = patch_find("fish.bite")) && p->on) apply_fish_bite();
     if ((p = patch_find("line.safe")) && p->on) apply_line_safe();
-    if ((p = patch_find("player.stamina")) && p->on) apply_player_stamina();
     if ((p = patch_find("cast.super")) && p->on) apply_cast_super();
     if ((p = patch_find("boat.fast")) && p->on) apply_boat_fast();
     if ((p = patch_find("reel.fast")) && p->on) apply_reel_fast();
@@ -566,8 +496,8 @@ static void m4_apply_all(void *unused) {
 }
 
 /* 需要 tick 重应用的补丁（fish.trophy 是一次性写入，不在此列） */
-static const char *const k_tick_tags[] = {"fish.stamina", "fish.bite", "line.safe", "player.stamina",
-                                          "cast.super", "boat.fast", "reel.fast", "ice.fast"};
+static const char *const k_tick_tags[] = {"line.safe", "cast.super", "boat.fast", "reel.fast",
+                                          "ice.fast"};
 
 static bool m4_any_enabled(void) {
     for (size_t i = 0; i < sizeof k_tick_tags / sizeof k_tick_tags[0]; i++) {
@@ -605,37 +535,6 @@ static void m4_stop_if_idle(void) {
 }
 
 /* 开关入口：on = 标记 + 立即应用一次 + 确保 tick 存活；off = 恢复原值 + 空闲则停 tick */
-static void f_fish_stamina(bool on) {
-    patch_t *p = patch_get("fish.stamina");
-    if (on) {
-        bool was = p->on;
-        p->on = true;
-        apply_fish_stamina();
-        if (!was) {
-            int n = p->n;
-            cnc_log("game: 秒赢对决 → FishData.stamina + 战斗时长 0.05s（已记录 %d 字段）", n);
-        }
-        m4_ensure_tick();
-    } else {
-        patch_restore("fish.stamina");
-        m4_stop_if_idle();
-    }
-}
-
-static void f_fish_bite(bool on) {
-    patch_t *p = patch_get("fish.bite");
-    if (on) {
-        bool was = p->on;
-        p->on = true;
-        apply_fish_bite();
-        if (!was) cnc_log("game: 即时上钩 → 咬钩率 1 + attract 100 + 追饵 60s");
-        m4_ensure_tick();
-    } else {
-        patch_restore("fish.bite");
-        m4_stop_if_idle();
-    }
-}
-
 static void f_line_safe(bool on) {
     patch_t *p = patch_get("line.safe");
     if (on) {
@@ -646,20 +545,6 @@ static void f_line_safe(bool on) {
         m4_ensure_tick();
     } else {
         patch_restore("line.safe");
-        m4_stop_if_idle();
-    }
-}
-
-static void f_player_stamina(bool on) {
-    patch_t *p = patch_get("player.stamina");
-    if (on) {
-        bool was = p->on;
-        p->on = true;
-        apply_player_stamina();
-        if (!was) cnc_log("game: 无限体力 → 划船/走路/破冰消耗 0（仅影响玩家体力条）");
-        m4_ensure_tick();
-    } else {
-        patch_restore("player.stamina");
         m4_stop_if_idle();
     }
 }
@@ -891,11 +776,8 @@ static void ids_dump(const char *line, char *out, size_t outsz) {
 /* ---------- 命令表（dispatch 与 state.get 共用） ---------- */
 
 static const struct { const char *cmd; void (*fn)(bool); } k_toggles[] = {
-    {"fish.stamina", f_fish_stamina},
     {"fish.trophy", f_fish_trophy},
-    {"fish.bite", f_fish_bite},
     {"line.safe", f_line_safe},
-    {"player.stamina", f_player_stamina},
     {"cast.super", f_cast_super},
 };
 
@@ -1109,70 +991,6 @@ static bool dispatch(const char *line, char *out, size_t outsz) {
                  "{\"ok\":true,\"target\":%d,\"was\":%d,\"reset_instances\":%d,"
                  "\"note\":\"计数器已归零，重新抚摸 %d 次即可再次触发\"}",
                  target, cur, reset, target);
-        return true;
-    }
-
-    if (strcmp(cmd, "fish.debug") == 0) {
-        /* 诊断：现场读 FishData.stamina 与 FishFightActionData.duration 的真实状态 */
-        int smin = 2147483647, smax = -2147483648, scnt = 0, sones = 0;
-        void *fk = cnc_find_class("Game", "FishData");
-        if (fk) {
-            void *fld = g_il2.class_get_field_from_name(fk, "stamina");
-            if (fld) {
-                int off = g_il2.field_get_offset(fld);
-                size_t n = 0;
-                void **insts = instances(fk, &n);
-                if (insts) {
-                    for (size_t i = 0; i < n; i++) {
-                        if (!insts[i]) continue;
-                        int v = *(int *)((char *)insts[i] + off);
-                        if (v < smin) smin = v;
-                        if (v > smax) smax = v;
-                        if (v == 1) sones++;
-                        scnt++;
-                    }
-                }
-            }
-        }
-        /* duration FloatRange：读解引用后的 min/max 现值 */
-        float dmin = -1, dmax = -1;
-        int dcnt = 0;
-        void *dk = cnc_find_class("Game", "FishFightActionData");
-        if (dk) {
-            void *dfld = g_il2.class_get_field_from_name(dk, "duration");
-            void *ik = NULL;
-            if (dfld && g_il2.field_get_type && g_il2.class_from_il2cpp_type) {
-                void *ft = g_il2.field_get_type(dfld);
-                if (ft) ik = g_il2.class_from_il2cpp_type(ft);
-            }
-            if (dfld && ik) {
-                void *fmin = g_il2.class_get_field_from_name(ik, "min");
-                void *fmax = g_il2.class_get_field_from_name(ik, "max");
-                if (fmin && fmax) {
-                    int off = g_il2.field_get_offset(dfld);
-                    int omin = g_il2.field_get_offset(fmin);
-                    int omax = g_il2.field_get_offset(fmax);
-                    size_t n = 0;
-                    void **insts = instances(dk, &n);
-                    if (insts) {
-                        for (size_t i = 0; i < n; i++) {
-                            if (!insts[i]) continue;
-                            void *ro = *(void **)((char *)insts[i] + off);
-                            if (!ro) continue;
-                            float a = *(float *)((char *)ro + omin);
-                            float b = *(float *)((char *)ro + omax);
-                            if (dmin < 0 || a < dmin) dmin = a;
-                            if (b > dmax) dmax = b;
-                            dcnt++;
-                        }
-                    }
-                }
-            }
-        }
-        snprintf(out, outsz,
-                 "{\"ok\":true,\"fish_stamina\":{\"count\":%d,\"min\":%d,\"max\":%d,\"ones\":%d},"
-                 "\"fight_duration\":{\"count\":%d,\"min\":%.2f,\"max\":%.2f}}",
-                 scnt, scnt ? smin : 0, scnt ? smax : 0, sones, dcnt, dmin, dmax);
         return true;
     }
 
